@@ -1,0 +1,571 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+
+from aiogram import Router, F
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+from bot.config import ADMIN_ID
+from bot.services.database import db, IST
+
+router = Router()
+
+USERS_PER_PAGE = 8
+
+
+# ---------------------------------------------------------------------------
+# Admin-only filter
+# ---------------------------------------------------------------------------
+
+def isAdmin(userId: int) -> bool:
+    return userId == ADMIN_ID
+
+
+# ---------------------------------------------------------------------------
+# FSM for set-limit input
+# ---------------------------------------------------------------------------
+
+class AdminStates(StatesGroup):
+    waitingSetLimit    = State()
+    waitingBroadcast   = State()
+    waitingGlobalLimit = State()
+    waitingBlacklistPhone = State()
+    waitingBlacklistReason = State()
+
+
+# ---------------------------------------------------------------------------
+# Keyboards
+# ---------------------------------------------------------------------------
+
+def adminMenuKeyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Users",           callback_data="adm:users:0")
+    builder.button(text="Stats",           callback_data="adm:stats")
+    builder.button(text="Reset All Limits",callback_data="adm:reset_all")
+    builder.button(text="Set Global Limit",callback_data="adm:global_limit")
+    builder.button(text="API Manager",     callback_data="aapi:menu")
+    builder.button(text="Proxy Manager",   callback_data="aprx:menu")
+    builder.button(text="Blacklist",       callback_data="adm:blacklist:0")
+    builder.adjust(2, 2, 2, 1)
+    return builder.as_markup()
+
+
+def usersListKeyboard(page: int, totalPages: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    if page > 0:
+        builder.button(text="Previous", callback_data=f"adm:users:{page - 1}")
+    if page < totalPages - 1:
+        builder.button(text="Next", callback_data=f"adm:users:{page + 1}")
+    builder.button(text="Back", callback_data="adm:menu")
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+def userActionKeyboard(userId: int, isBanned: bool) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    banLabel = "Unban" if isBanned else "Ban"
+    builder.button(text=banLabel, callback_data=f"adm:toggle_ban:{userId}")
+    builder.button(text="Set Limit", callback_data=f"adm:set_limit:{userId}")
+    builder.button(text="Reset Today", callback_data=f"adm:reset_user:{userId}")
+    builder.button(text="History", callback_data=f"adm:history:{userId}")
+    builder.button(text="Back to Users", callback_data="adm:users:0")
+    builder.adjust(2, 2, 1)
+    return builder.as_markup()
+
+
+def confirmResetAllKeyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Yes, reset all", callback_data="adm:confirm_reset_all")
+    builder.button(text="Cancel", callback_data="adm:menu")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def backToAdminKeyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Admin Menu", callback_data="adm:menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def formatUserRow(u: dict) -> str:
+    name = u["firstName"]
+    if u.get("lastName"):
+        name += f" {u['lastName']}"
+    username = f"@{u['username']}" if u.get("username") else "no username"
+    status = "BANNED" if u["isBanned"] else f"{u['testsToday']}/{u['dailyLimit']}"
+    joined = datetime.fromtimestamp(u["joinedAt"], tz=IST).strftime("%d %b %Y")
+    return f"{name} ({username}) | {status} | joined {joined}"
+
+
+def formatUserDetail(u: dict) -> str:
+    name = u["firstName"]
+    if u.get("lastName"):
+        name += f" {u['lastName']}"
+    username = f"@{u['username']}" if u.get("username") else "no username"
+    status = "BANNED" if u["isBanned"] else "Active"
+    joined = datetime.fromtimestamp(u["joinedAt"], tz=IST).strftime("%d %b %Y %H:%M")
+    return (
+        f"User Detail\n\n"
+        f"Name     : {name}\n"
+        f"Username : {username}\n"
+        f"ID       : {u['userId']}\n"
+        f"Status   : {status}\n"
+        f"Tests today : {u['testsToday']} / {u['dailyLimit']}\n"
+        f"Joined   : {joined}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# /admin command
+# ---------------------------------------------------------------------------
+
+@router.message(Command("admin"))
+async def cmdAdmin(message: Message, state: FSMContext) -> None:
+    if not isAdmin(message.from_user.id):
+        await message.answer("Unknown command.")
+        return
+    await state.clear()
+    await message.answer("Admin Panel", reply_markup=adminMenuKeyboard())
+
+
+@router.callback_query(F.data == "adm:menu")
+async def cbAdminMenu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text("Admin Panel", reply_markup=adminMenuKeyboard())
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "adm:stats")
+async def cbAdminStats(callback: CallbackQuery) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    total = db.getUserCount()
+    users = db.getAllUsers(offset=0, limit=9999)
+    banned = sum(1 for u in users if u["isBanned"])
+    activeToday = sum(1 for u in users if u["testsToday"] > 0)
+    totalTestsToday = sum(u["testsToday"] for u in users)
+    text = (
+        "Bot Stats\n\n"
+        f"Total users      : {total}\n"
+        f"Banned           : {banned}\n"
+        f"Active today     : {activeToday}\n"
+        f"Tests run today  : {totalTestsToday}"
+    )
+    await callback.message.edit_text(text, reply_markup=backToAdminKeyboard())
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Users list
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("adm:users:"))
+async def cbUsersList(callback: CallbackQuery) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    page = int(callback.data.split(":")[2])
+    total = db.getUserCount()
+    totalPages = max(1, -(-total // USERS_PER_PAGE))
+    users = db.getAllUsers(offset=page * USERS_PER_PAGE, limit=USERS_PER_PAGE)
+
+    if not users:
+        await callback.message.edit_text(
+            "No users registered yet.",
+            reply_markup=backToAdminKeyboard()
+        )
+        await callback.answer()
+        return
+
+    lines = [f"Users  (page {page + 1}/{totalPages})\n"]
+    for u in users:
+        lines.append(formatUserRow(u))
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=usersListKeyboard(page, totalPages)
+    )
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# User detail - tapping the user row opens detail
+# The user list has inline buttons per user
+# We need a per-user button - add them inside the list
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("adm:user:"))
+async def cbUserDetail(callback: CallbackQuery) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    userId = int(callback.data.split(":")[2])
+    u = db.getUser(userId)
+    if not u:
+        await callback.answer("User not found.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        formatUserDetail(u),
+        reply_markup=userActionKeyboard(userId, bool(u["isBanned"]))
+    )
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Ban / unban
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("adm:toggle_ban:"))
+async def cbToggleBan(callback: CallbackQuery) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    userId = int(callback.data.split(":")[2])
+    u = db.getUser(userId)
+    if not u:
+        await callback.answer("User not found.", show_alert=True)
+        return
+    if u["isBanned"]:
+        db.unbanUser(userId)
+        await callback.answer("User unbanned.")
+    else:
+        db.banUser(userId)
+        await callback.answer("User banned.")
+    u = db.getUser(userId)
+    await callback.message.edit_text(
+        formatUserDetail(u),
+        reply_markup=userActionKeyboard(userId, bool(u["isBanned"]))
+    )
+
+
+# ---------------------------------------------------------------------------
+# Set individual limit
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("adm:set_limit:"))
+async def cbSetLimit(callback: CallbackQuery, state: FSMContext) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    userId = int(callback.data.split(":")[2])
+    await state.set_state(AdminStates.waitingSetLimit)
+    await state.update_data(targetUserId=userId)
+    await callback.message.edit_text(
+        f"Set Daily Limit\n\nEnter the new daily test limit for user {userId}.\n"
+        "Enter a number between 0 and 999."
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waitingSetLimit)
+async def handleSetLimit(message: Message, state: FSMContext) -> None:
+    if not isAdmin(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    try:
+        limit = int(raw)
+        if not 0 <= limit <= 999:
+            raise ValueError
+    except ValueError:
+        await message.answer("Enter a number between 0 and 999.")
+        return
+    data = await state.get_data()
+    targetUserId = data["targetUserId"]
+    db.setDailyLimit(targetUserId, limit)
+    await state.clear()
+    u = db.getUser(targetUserId)
+    await message.answer(
+        f"Limit updated.\n\nUser {targetUserId} now has a daily limit of {limit}.",
+        reply_markup=userActionKeyboard(targetUserId, bool(u["isBanned"]))
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reset individual user today count
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("adm:reset_user:"))
+async def cbResetUser(callback: CallbackQuery) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    userId = int(callback.data.split(":")[2])
+    db.resetUserTests(userId)
+    await callback.answer("Daily count reset.")
+    u = db.getUser(userId)
+    await callback.message.edit_text(
+        formatUserDetail(u),
+        reply_markup=userActionKeyboard(userId, bool(u["isBanned"]))
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reset all users
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "adm:reset_all")
+async def cbResetAll(callback: CallbackQuery) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "Reset All Limits\n\nThis will reset today's test count for every user.\nAre you sure?",
+        reply_markup=confirmResetAllKeyboard()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:confirm_reset_all")
+async def cbConfirmResetAll(callback: CallbackQuery) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    db.resetAllTests()
+    await callback.message.edit_text(
+        "Done. All daily counts have been reset.",
+        reply_markup=backToAdminKeyboard()
+    )
+    await callback.answer("All limits reset.")
+
+
+# ---------------------------------------------------------------------------
+# Set global limit
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "adm:global_limit")
+async def cbGlobalLimit(callback: CallbackQuery, state: FSMContext) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waitingGlobalLimit)
+    await callback.message.edit_text(
+        "Set Global Daily Limit\n\n"
+        "Enter a number. This will update the daily limit for every user."
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waitingGlobalLimit)
+async def handleGlobalLimit(message: Message, state: FSMContext) -> None:
+    if not isAdmin(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    try:
+        limit = int(raw)
+        if not 0 <= limit <= 999:
+            raise ValueError
+    except ValueError:
+        await message.answer("Enter a number between 0 and 999.")
+        return
+    db.setGlobalDailyLimit(limit)
+    await state.clear()
+    await message.answer(
+        f"Global limit updated. All users now have a daily limit of {limit}.",
+        reply_markup=backToAdminKeyboard()
+    )
+
+
+# ---------------------------------------------------------------------------
+# User history
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("adm:history:"))
+async def cbUserHistory(callback: CallbackQuery) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    userId = int(callback.data.split(":")[2])
+    history = db.getUserHistory(userId, limit=10)
+    if not history:
+        await callback.answer("No test history for this user.", show_alert=True)
+        return
+
+    lines = [f"Test History  (last {len(history)})\n"]
+    for h in history:
+        from datetime import datetime
+        dt = datetime.fromtimestamp(h["startedAt"], tz=IST).strftime("%d %b %H:%M")
+        lines.append(
+            f"{dt}  {h['phone']}  {h['duration']}s  "
+            f"OTP {h['otpHits']}  REQ {h['totalReqs']}"
+        )
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Back", callback_data=f"adm:user:{userId}")
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+# ---------------------------------------------------------------------------
+# Phone Blacklist
+# ---------------------------------------------------------------------------
+
+BLACKLIST_PER_PAGE = 10
+
+
+def blacklistKeyboard(page: int, totalPages: int, entries: list) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    start = page * BLACKLIST_PER_PAGE
+    pageEntries = entries[start:start + BLACKLIST_PER_PAGE]
+    for e in pageEntries:
+        builder.button(
+            text=f"Remove: {e['phone']}",
+            callback_data=f"adm:bl_remove:{e['phone']}"
+        )
+    builder.button(text="Add Number", callback_data="adm:bl_add")
+    if page > 0:
+        builder.button(text="Previous", callback_data=f"adm:blacklist:{page - 1}")
+    if page < totalPages - 1:
+        builder.button(text="Next", callback_data=f"adm:blacklist:{page + 1}")
+    builder.button(text="Back", callback_data="adm:menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+@router.callback_query(F.data.startswith("adm:blacklist:"))
+async def cbBlacklist(callback: CallbackQuery, state: FSMContext) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    await state.clear()
+    page = int(callback.data.split(":")[2])
+    entries = db.getAllBlacklisted()
+    totalPages = max(1, -(-len(entries) // BLACKLIST_PER_PAGE))
+
+    if not entries:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="Add Number", callback_data="adm:bl_add")
+        builder.button(text="Back",       callback_data="adm:menu")
+        builder.adjust(1)
+        await callback.message.edit_text(
+            "Phone Blacklist\n\nNo numbers blacklisted yet.\n"
+            "Add a number to permanently block it from being used as a test target.",
+            reply_markup=builder.as_markup()
+        )
+        await callback.answer()
+        return
+
+    lines = [f"Phone Blacklist  ({len(entries)} numbers)\n"]
+    start = page * BLACKLIST_PER_PAGE
+    pageEntries = entries[start:start + BLACKLIST_PER_PAGE]
+    for e in pageEntries:
+        reason = f"  — {e['reason']}" if e.get("reason") else ""
+        dt = datetime.fromtimestamp(e["addedAt"], tz=IST).strftime("%d %b %Y")
+        lines.append(f"{e['phone']}{reason}  ({dt})")
+
+    lines.append("\nPress Remove to unblock a number.")
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=blacklistKeyboard(page, totalPages, entries)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:bl_add")
+async def cbBlAdd(callback: CallbackQuery, state: FSMContext) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waitingBlacklistPhone)
+    await callback.message.edit_text(
+        "Add to Blacklist\n\n"
+        "Enter the 10-digit phone number to permanently block."
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waitingBlacklistPhone)
+async def handleBlPhone(message: Message, state: FSMContext) -> None:
+    if not isAdmin(message.from_user.id):
+        return
+    phone = (message.text or "").strip()
+    if not phone.isdigit() or len(phone) != 10:
+        await message.answer("Enter exactly 10 digits.")
+        return
+    await state.update_data(blPhone=phone)
+    await state.set_state(AdminStates.waitingBlacklistReason)
+    await message.answer(
+        f"Number: {phone}\n\n"
+        "Enter a reason for blacklisting (optional).\n"
+        "Or send  -  to skip."
+    )
+
+
+@router.message(AdminStates.waitingBlacklistReason)
+async def handleBlReason(message: Message, state: FSMContext) -> None:
+    if not isAdmin(message.from_user.id):
+        return
+    reason = (message.text or "").strip()
+    if reason == "-":
+        reason = ""
+    data = await state.get_data()
+    phone = data["blPhone"]
+    db.blacklistPhone(phone, reason)
+    await state.clear()
+
+    reasonNote = f"\nReason: {reason}" if reason else ""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="View Blacklist", callback_data="adm:blacklist:0")
+    builder.button(text="Admin Menu",     callback_data="adm:menu")
+    builder.adjust(1)
+    await message.answer(
+        f"Blacklisted.\n\n{phone} has been permanently blocked.{reasonNote}\n"
+        "No user can use this number as a test target.",
+        reply_markup=builder.as_markup()
+    )
+
+
+@router.callback_query(F.data.startswith("adm:bl_remove:"))
+async def cbBlRemove(callback: CallbackQuery) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    phone = callback.data.split(":", 2)[2]
+    db.unblacklistPhone(phone)
+    await callback.answer(f"Removed: {phone}")
+
+    entries = db.getAllBlacklisted()
+    totalPages = max(1, -(-len(entries) // BLACKLIST_PER_PAGE))
+
+    if not entries:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="Add Number", callback_data="adm:bl_add")
+        builder.button(text="Back",       callback_data="adm:menu")
+        builder.adjust(1)
+        await callback.message.edit_text(
+            "Phone Blacklist\n\nBlacklist is now empty.",
+            reply_markup=builder.as_markup()
+        )
+        return
+
+    lines = [f"Phone Blacklist  ({len(entries)} numbers)\n"]
+    for e in entries[:BLACKLIST_PER_PAGE]:
+        reason = f"  — {e['reason']}" if e.get("reason") else ""
+        dt = datetime.fromtimestamp(e["addedAt"], tz=IST).strftime("%d %b %Y")
+        lines.append(f"{e['phone']}{reason}  ({dt})")
+    lines.append("\nPress Remove to unblock a number.")
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=blacklistKeyboard(0, totalPages, entries)
+    )
