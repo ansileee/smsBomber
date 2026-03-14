@@ -273,7 +273,6 @@ async def callApi(
             headers=headers, params=params,
             json=jsonData, data=data, cookies=cookies,
             timeout=aiohttp.ClientTimeout(total=6, connect=3),
-            ssl=False,
         ) as resp:
             latency = time.time() - t0
             text    = await resp.text()
@@ -315,7 +314,7 @@ async def testSingleApi(api: dict, phone: str) -> dict:
         cookies  = replacePlaceholders(cfg.get("cookies"), phone)
         url      = cfg["url"].replace("{phone}", phone)
 
-        connector = TCPConnector(limit=10, ssl=False)
+        connector = TCPConnector(limit=10)
         async with aiohttp.ClientSession(connector=connector) as session:
             t0 = time.time()
             async with session.request(
@@ -323,7 +322,6 @@ async def testSingleApi(api: dict, phone: str) -> dict:
                 headers=headers, params=params,
                 json=jsonData, data=data, cookies=cookies,
                 timeout=aiohttp.ClientTimeout(total=15),
-                ssl=False,
             ) as resp:
                 latency = round((time.time() - t0) * 1000)
                 text    = await resp.text()
@@ -333,8 +331,15 @@ async def testSingleApi(api: dict, phone: str) -> dict:
                     "latencyMs": latency,
                     "snippet":   text[:300].strip(),
                 }
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": "Timeout (>15s)"}
+    except aiohttp.ClientConnectorError as e:
+        return {"ok": False, "error": f"Connection failed: {str(e)[:60]}"}
+    except aiohttp.ClientSSLError as e:
+        return {"ok": False, "error": f"SSL error: {str(e)[:60]}"}
     except Exception as e:
-        return {"ok": False, "error": str(e)[:80]}
+        err = str(e).strip() or type(e).__name__
+        return {"ok": False, "error": err[:80]}
 
 
 # ---------------------------------------------------------------------------
@@ -439,7 +444,7 @@ class TesterRunner:
         self._running = False
 
     async def _sender(self, proxy: Optional[str]) -> None:
-        connector = ProxyConnector.from_url(proxy) if proxy else TCPConnector(limit=200, ssl=False)
+        connector = ProxyConnector.from_url(proxy) if proxy else TCPConnector(limit=200)
         async with aiohttp.ClientSession(connector=connector) as session:
             activeTasks: set = set()
 
