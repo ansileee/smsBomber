@@ -33,12 +33,13 @@ def isAdmin(userId: int) -> bool:
 
 
 class ApiAdminStates(StatesGroup):
-    waitingApiJson     = State()
-    waitingConfirm     = State()
-    waitingEditJson    = State()
-    waitingEditConfirm = State()
-    waitingRename      = State()
-    waitingTestPhone   = State()
+    waitingApiJson          = State()
+    waitingConfirm          = State()
+    waitingConfirmTestPhone = State()
+    waitingEditJson         = State()
+    waitingEditConfirm      = State()
+    waitingRename           = State()
+    waitingTestPhone        = State()
 
 
 # ---------------------------------------------------------------------------
@@ -46,9 +47,33 @@ class ApiAdminStates(StatesGroup):
 # ---------------------------------------------------------------------------
 
 def randomPhone() -> str:
-    prefixes = ["98","97","96","95","94","93","91","90","89","88","87","86","85",
-                "84","83","82","81","80","79","78","77","76","75","74","73","72","70"]
-    return random.choice(prefixes) + "".join(random.choices(string.digits, k=8))
+    """
+    Generate a valid-looking Indian mobile number.
+    Uses real operator prefixes so sites don't reject on prefix validation.
+    Jio: 70,72,73,74,75,76,77,78,79,89,90,91,93,96,97,98,99
+    Airtel: 70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98
+    Vi/BSNL: 70,72,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99
+    All valid Indian mobile prefixes (6-9 start):
+    """
+    prefixes = [
+        "6360","6361","6362","6363","6364","6365","6366","6367","6368","6369",
+        "7000","7001","7002","7003","7004","7005","7006","7007","7008","7009",
+        "7010","7200","7201","7202","7207","7208","7250","7300","7400","7500",
+        "7600","7700","7800","7900","8000","8001","8002","8003","8004","8005",
+        "8006","8007","8008","8009","8010","8050","8080","8090","8100","8104",
+        "8105","8106","8107","8108","8109","8110","8111","8112","8113","8800",
+        "8801","8802","8803","8804","8805","8900","8901","8902","8903","8904",
+        "9000","9001","9002","9003","9004","9005","9006","9007","9008","9009",
+        "9010","9011","9012","9013","9014","9015","9016","9017","9018","9019",
+        "9100","9101","9102","9103","9104","9105","9106","9107","9108","9109",
+        "9200","9201","9202","9203","9204","9205","9300","9301","9400","9401",
+        "9500","9600","9700","9800","9810","9820","9830","9840","9850","9860",
+        "9870","9880","9890","9900","9910","9920","9930","9940","9950","9960",
+        "9970","9980","9990","9999",
+    ]
+    prefix = random.choice(prefixes)
+    remaining = 10 - len(prefix)
+    return prefix + "".join(random.choices(string.digits, k=remaining))
 
 
 def getMergedTagged() -> List[dict]:
@@ -598,7 +623,19 @@ async def handleApiJson(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(pendingApiJson=json.dumps(cfg), pendingApiConfig=cfg)
     await state.set_state(ApiAdminStates.waitingConfirm)
-    await message.answer(f"{formatDetail(cfg)}\n\nSave?", reply_markup=confirmKeyboard("aapi:confirm_save"), parse_mode=PM)
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Save",        callback_data="aapi:confirm_save")
+    builder.button(text="Demo Test",   callback_data="aapi:confirm_demotest")
+    builder.button(text="Test",        callback_data="aapi:confirm_test")
+    builder.button(text="Cancel",      callback_data="aapi:menu")
+    builder.adjust(2, 2)
+    await message.answer(
+        f"{formatDetail(cfg)}\n\n"
+        f"{i('Save — add to bot  |  Demo Test — fire with random number  |  Test — enter your own number')}",
+        reply_markup=builder.as_markup(),
+        parse_mode=PM
+    )
 
 
 @router.callback_query(F.data == "aapi:confirm_save", StateFilter(ApiAdminStates.waitingConfirm))
@@ -616,12 +653,227 @@ async def cbConfirmSave(callback: CallbackQuery, state: FSMContext) -> None:
     db.addCustomApi(name=cfg["name"], method=cfg["method"], url=cfg["url"], configJson=cfgJson)
     await state.clear()
     total = len(getMergedTagged())
+
+    # Show post-save options: test it now or go back
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Demo Test",   callback_data=f"aapi:postsave_demotest")
+    builder.button(text="Test",        callback_data=f"aapi:postsave_test")
+    builder.button(text="API Manager", callback_data="aapi:menu")
+    builder.adjust(2, 1)
     await callback.message.edit_text(
-        f"{b('Saved.')}  {_esc(cfg['name'])} added.  Total APIs: {c(str(total))}",
-        reply_markup=backToApiMenuKeyboard(),
+        f"{b('Saved.')}  {_esc(cfg['name'])} added.  Total APIs: {c(str(total))}\n\n"
+        f"{i('Test it now or go back.')}",
+        reply_markup=builder.as_markup(),
         parse_mode=PM
     )
     await callback.answer("Saved.")
+
+
+# ---------------------------------------------------------------------------
+# Demo Test — fire with random valid number (during add flow)
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "aapi:confirm_demotest", StateFilter(ApiAdminStates.waitingConfirm))
+async def cbConfirmDemoTest(callback: CallbackQuery, state: FSMContext) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    data = await state.get_data()
+    cfg  = data.get("pendingApiConfig")
+    if not cfg:
+        await callback.answer("Session expired.", show_alert=True)
+        return
+
+    phone   = randomPhone()
+    waiting = await callback.message.edit_text(
+        f"{b('Demo Test')}\n\nFiring one request with random number {c(phone)}...",
+        parse_mode=PM
+    )
+    await callback.answer()
+
+    result = await testSingleApi(cleanCfg(cfg), phone)
+    await _showTestResult(waiting, cfg, phone, result, backCb="aapi:confirm_back")
+
+
+# ---------------------------------------------------------------------------
+# Test — enter own number (during add flow)
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "aapi:confirm_test", StateFilter(ApiAdminStates.waitingConfirm))
+async def cbConfirmTest(callback: CallbackQuery, state: FSMContext) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    await state.set_state(ApiAdminStates.waitingConfirmTestPhone)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Back", callback_data="aapi:confirm_back")
+    await callback.message.edit_text(
+        f"{b('Test API')}\n\nEnter a 10-digit number to test with.",
+        reply_markup=builder.as_markup(),
+        parse_mode=PM
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "aapi:confirm_back")
+async def cbConfirmBack(callback: CallbackQuery, state: FSMContext) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    await state.set_state(ApiAdminStates.waitingConfirm)
+    data = await state.get_data()
+    cfg  = data.get("pendingApiConfig")
+    if not cfg:
+        await callback.answer("Session expired.", show_alert=True)
+        return
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Save",      callback_data="aapi:confirm_save")
+    builder.button(text="Demo Test", callback_data="aapi:confirm_demotest")
+    builder.button(text="Test",      callback_data="aapi:confirm_test")
+    builder.button(text="Cancel",    callback_data="aapi:menu")
+    builder.adjust(2, 2)
+    await callback.message.edit_text(
+        f"{formatDetail(cfg)}\n\n"
+        f"{i('Save  |  Demo Test — random number  |  Test — your number')}",
+        reply_markup=builder.as_markup(),
+        parse_mode=PM
+    )
+    await callback.answer()
+
+
+@router.message(StateFilter(ApiAdminStates.waitingConfirmTestPhone))
+async def handleConfirmTestPhone(message: Message, state: FSMContext) -> None:
+    if not isAdmin(message.from_user.id):
+        return
+    phone = (message.text or "").strip()
+    if not phone.isdigit() or len(phone) != 10:
+        await message.answer("Enter exactly 10 digits.")
+        return
+    data = await state.get_data()
+    cfg  = data.get("pendingApiConfig")
+    if not cfg:
+        await message.answer("Session expired. Go back and paste the API config again.")
+        await state.clear()
+        return
+    await state.set_state(ApiAdminStates.waitingConfirm)
+    waiting = await message.answer(
+        f"{b('Testing')}  {_esc(cfg['name'])} with {c(phone)}...",
+        parse_mode=PM
+    )
+    result = await testSingleApi(cleanCfg(cfg), phone)
+    await _showTestResult(waiting, cfg, phone, result, backCb="aapi:confirm_back")
+
+
+# ---------------------------------------------------------------------------
+# Post-save test buttons
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "aapi:postsave_demotest")
+async def cbPostSaveDemoTest(callback: CallbackQuery) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    # Find the most recently added custom API
+    customApis = db.getAllCustomApis()
+    if not customApis:
+        await callback.answer("No API found.", show_alert=True)
+        return
+    row   = sorted(customApis, key=lambda x: x["id"], reverse=True)[0]
+    cfg   = json.loads(row["configJson"])
+    phone = randomPhone()
+    waiting = await callback.message.edit_text(
+        f"{b('Demo Test')}\n\nFiring one request with random number {c(phone)}...",
+        parse_mode=PM
+    )
+    await callback.answer()
+    result = await testSingleApi(cleanCfg(cfg), phone)
+    await _showTestResult(waiting, cfg, phone, result, backCb="aapi:menu")
+
+
+@router.callback_query(F.data == "aapi:postsave_test")
+async def cbPostSaveTest(callback: CallbackQuery, state: FSMContext) -> None:
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    customApis = db.getAllCustomApis()
+    if not customApis:
+        await callback.answer("No API found.", show_alert=True)
+        return
+    row  = sorted(customApis, key=lambda x: x["id"], reverse=True)[0]
+    await state.set_state(ApiAdminStates.waitingTestPhone)
+    await state.update_data(testApiDbId=row["id"], testApiIdx=None)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Back", callback_data="aapi:menu")
+    cfg = json.loads(row["configJson"])
+    await callback.message.edit_text(
+        f"{b('Test')}  {_esc(cfg['name'])}\n{c(cfg['method'])}  {_esc(cfg['url'])}\n\nEnter a 10-digit phone number.",
+        reply_markup=builder.as_markup(),
+        parse_mode=PM
+    )
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Shared test result display
+# ---------------------------------------------------------------------------
+
+async def _showTestResult(message, cfg: dict, phone: str, result: dict, backCb: str) -> None:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Demo Test Again", callback_data=f"aapi:quickdemo:{cfg['name'][:20]}")
+    builder.button(text="Back",            callback_data=backCb)
+    builder.adjust(1)
+
+    if not result["ok"]:
+        await message.edit_text(
+            f"{b('Test Failed')}\n\n"
+            f"API    {_esc(cfg['name'])}\n"
+            f"Phone  {c(phone)}\n"
+            f"Error  {c(_esc(result['error']))}",
+            reply_markup=builder.as_markup(),
+            parse_mode=PM
+        )
+        return
+
+    status  = result["status"]
+    latency = result["latencyMs"]
+    snippet = _esc((result.get("snippet") or "(empty)")[:120])
+    if status == 429:   lbl = "RATE LIMITED"
+    elif status < 300:  lbl = "OK"
+    elif status < 500:  lbl = "CLIENT ERR"
+    else:               lbl = "SERVER ERR"
+
+    await message.edit_text(
+        f"{b('Test Result')}\n\n"
+        f"API      {_esc(cfg['name'])}\n"
+        f"Phone    {c(phone)}\n"
+        f"Status   {c(f'{lbl} {status}')}\n"
+        f"Latency  {c(f'{latency}ms')}\n\n"
+        f"{i('Response')}\n{c(snippet)}",
+        reply_markup=builder.as_markup(),
+        parse_mode=PM
+    )
+
+
+@router.callback_query(F.data.startswith("aapi:quickdemo:"))
+async def cbQuickDemo(callback: CallbackQuery) -> None:
+    """Demo Test Again — re-fires with a new random number, works from anywhere."""
+    if not isAdmin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    apiName  = callback.data.split(":", 2)[2]
+    allApis  = getMergedTagged()
+    api      = next((a for a in allApis if a["name"][:20] == apiName), None)
+    if not api:
+        await callback.answer("API not found.", show_alert=True)
+        return
+    phone   = randomPhone()
+    waiting = await callback.message.edit_text(
+        f"{b('Demo Test')}\n\nFiring one request with random number {c(phone)}...",
+        parse_mode=PM
+    )
+    await callback.answer()
+    result = await testSingleApi(cleanCfg(api), phone)
+    await _showTestResult(waiting, cleanCfg(api), phone, result, backCb="aapi:menu")
 
 
 # ---------------------------------------------------------------------------
