@@ -223,6 +223,29 @@ class ApiQueue:
 # Core API caller
 # ---------------------------------------------------------------------------
 
+def coerceTypes(obj: any, original: any) -> any:
+    """
+    After replacePlaceholders turns everything into strings,
+    restore numeric types based on what the original config had.
+    E.g. if original had {"phone": 919876543210} (int), keep it as int after replacement.
+    """
+    if isinstance(original, dict) and isinstance(obj, dict):
+        return {k: coerceTypes(obj.get(k, v), v) for k, v in original.items()}
+    if isinstance(original, list) and isinstance(obj, list):
+        return [coerceTypes(o, p) for o, p in zip(obj, original)]
+    if isinstance(original, int) and isinstance(obj, str):
+        try:
+            return int(obj)
+        except (ValueError, TypeError):
+            return obj
+    if isinstance(original, float) and isinstance(obj, str):
+        try:
+            return float(obj)
+        except (ValueError, TypeError):
+            return obj
+    return obj
+
+
 async def callApi(
     session: aiohttp.ClientSession,
     api: dict,
@@ -239,7 +262,7 @@ async def callApi(
         cfg      = copy.deepcopy(api)
         headers  = replacePlaceholders(cfg.get("headers"), phone)
         params   = replacePlaceholders(cfg.get("params"), phone)
-        jsonData = replacePlaceholders(cfg.get("json"), phone)
+        jsonData = coerceTypes(replacePlaceholders(cfg.get("json"), phone), api.get("json"))
         data     = replacePlaceholders(cfg.get("data"), phone)
         cookies  = replacePlaceholders(cfg.get("cookies"), phone)
         url      = cfg["url"].replace("{phone}", phone)
@@ -287,7 +310,7 @@ async def testSingleApi(api: dict, phone: str) -> dict:
         cfg      = copy.deepcopy(api)
         headers  = replacePlaceholders(cfg.get("headers"), phone)
         params   = replacePlaceholders(cfg.get("params"), phone)
-        jsonData = replacePlaceholders(cfg.get("json"), phone)
+        jsonData = coerceTypes(replacePlaceholders(cfg.get("json"), phone), api.get("json"))
         data     = replacePlaceholders(cfg.get("data"), phone)
         cookies  = replacePlaceholders(cfg.get("cookies"), phone)
         url      = cfg["url"].replace("{phone}", phone)
