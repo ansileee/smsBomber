@@ -15,7 +15,7 @@ def getIstToday() -> str:
 
 
 def getSecondsUntilMidnightIst() -> float:
-    now = datetime.now(IST)
+    now      = datetime.now(IST)
     midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     return (midnight - now).total_seconds()
 
@@ -25,6 +25,7 @@ class Database:
         self._conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._createTables()
 
     def _createTables(self) -> None:
@@ -38,6 +39,7 @@ class Database:
                 isBanned      INTEGER NOT NULL DEFAULT 0,
                 dailyLimit    INTEGER NOT NULL DEFAULT 10,
                 testsToday    INTEGER NOT NULL DEFAULT 0,
+                testsTotal    INTEGER NOT NULL DEFAULT 0,
                 lastResetDate TEXT NOT NULL DEFAULT ''
             );
 
@@ -84,6 +86,12 @@ class Database:
                 addedAt     REAL NOT NULL
             );
         """)
+        # Add testsTotal column to existing DBs that don't have it yet
+        try:
+            self._conn.execute("ALTER TABLE users ADD COLUMN testsTotal INTEGER NOT NULL DEFAULT 0")
+            self._conn.commit()
+        except Exception:
+            pass  # Column already exists
         self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -95,6 +103,7 @@ class Database:
             "SELECT userId FROM users WHERE userId = ?", (userId,)
         ).fetchone()
         if existing:
+            # Only update display info, never touch counts or dates
             self._conn.execute(
                 "UPDATE users SET username=?, firstName=?, lastName=? WHERE userId=?",
                 (username, firstName, lastName or "", userId)
@@ -102,8 +111,8 @@ class Database:
             self._conn.commit()
             return False
         self._conn.execute(
-            "INSERT INTO users (userId, username, firstName, lastName, joinedAt, dailyLimit, lastResetDate) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO users (userId, username, firstName, lastName, joinedAt, dailyLimit, lastResetDate, testsToday, testsTotal) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)",
             (userId, username, firstName, lastName or "", time.time(), DEFAULT_DAILY_LIMIT, getIstToday())
         )
         self._conn.commit()
@@ -139,12 +148,13 @@ class Database:
         self._conn.commit()
 
     # ------------------------------------------------------------------
-    # Daily limit logic
+    # Daily limit logic — reset only happens at midnight IST via scheduler
     # ------------------------------------------------------------------
 
     def _ensureResetForUser(self, userId: int) -> None:
+        """Reset daily count if calendar date has changed in IST timezone."""
         today = getIstToday()
-        row = self._conn.execute(
+        row   = self._conn.execute(
             "SELECT lastResetDate FROM users WHERE userId=?", (userId,)
         ).fetchone()
         if row and row["lastResetDate"] != today:
@@ -169,11 +179,13 @@ class Database:
     def incrementTestCount(self, userId: int) -> None:
         self._ensureResetForUser(userId)
         self._conn.execute(
-            "UPDATE users SET testsToday = testsToday + 1 WHERE userId=?", (userId,)
+            "UPDATE users SET testsToday = testsToday + 1, testsTotal = testsTotal + 1 WHERE userId=?",
+            (userId,)
         )
         self._conn.commit()
 
     def resetUserTests(self, userId: int) -> None:
+        """Reset only today's count, never total."""
         self._conn.execute(
             "UPDATE users SET testsToday=0, lastResetDate=? WHERE userId=?",
             (getIstToday(), userId)
@@ -181,17 +193,18 @@ class Database:
         self._conn.commit()
 
     def resetAllTests(self) -> None:
+        """Reset only today's count for all users, never total."""
         today = getIstToday()
         self._conn.execute("UPDATE users SET testsToday=0, lastResetDate=?", (today,))
         self._conn.commit()
 
     # ------------------------------------------------------------------
-    # Test history
+    # Test history — persisted to DB, survives restarts
     # ------------------------------------------------------------------
 
     def startTestRecord(self, userId: int, phone: str, duration: int, workers: int) -> int:
         cur = self._conn.execute(
-            "INSERT INTO testHistory (userId, phone, duration, workers, startedAt) VALUES (?,?,?,?,?)",
+            "INSERT INTO testHistory (userId, phone, duration, workers, startedAt) VALUES (?, ?, ?, ?, ?)",
             (userId, phone, duration, workers, time.time())
         )
         self._conn.commit()
@@ -217,17 +230,19 @@ class Database:
 
     def addCustomApi(self, name: str, method: str, url: str, configJson: str) -> int:
         cur = self._conn.execute(
-            "INSERT INTO customApis (name, method, url, configJson, addedAt) VALUES (?,?,?,?,?)",
+            "INSERT INTO customApis (name, method, url, configJson, addedAt) VALUES (?, ?, ?, ?, ?)",
             (name, method, url, configJson, time.time())
         )
         self._conn.commit()
         return cur.lastrowid
 
     def getAllCustomApis(self) -> List[Dict[str, Any]]:
-        rows = self._conn.execute(
-            "SELECT * FROM customApis ORDER BY addedAt DESC"
-        ).fetchall()
+        rows = self._conn.execute("SELECT * FROM customApis ORDER BY addedAt DESC").fetchall()
         return [dict(r) for r in rows]
+
+    def getCustomApi(self, apiId: int) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute("SELECT * FROM customApis WHERE id=?", (apiId,)).fetchone()
+        return dict(row) if row else None
 
     def updateCustomApi(self, apiId: int, name: str, method: str, url: str, configJson: str) -> None:
         self._conn.execute(
@@ -240,34 +255,24 @@ class Database:
         self._conn.execute("DELETE FROM customApis WHERE id=?", (apiId,))
         self._conn.commit()
 
-    def getCustomApi(self, apiId: int) -> Optional[Dict[str, Any]]:
-        row = self._conn.execute(
-            "SELECT * FROM customApis WHERE id=?", (apiId,)
-        ).fetchone()
-        return dict(row) if row else None
-
     # ------------------------------------------------------------------
     # Proxy files
     # ------------------------------------------------------------------
 
     def addProxyFile(self, label: str, content: str, proxyCount: int) -> int:
         cur = self._conn.execute(
-            "INSERT INTO proxyFiles (label, content, proxyCount, uploadedAt) VALUES (?,?,?,?)",
+            "INSERT INTO proxyFiles (label, content, proxyCount, uploadedAt) VALUES (?, ?, ?, ?)",
             (label, content, proxyCount, time.time())
         )
         self._conn.commit()
         return cur.lastrowid
 
     def getAllProxyFiles(self) -> List[Dict[str, Any]]:
-        rows = self._conn.execute(
-            "SELECT * FROM proxyFiles ORDER BY uploadedAt DESC"
-        ).fetchall()
+        rows = self._conn.execute("SELECT * FROM proxyFiles ORDER BY uploadedAt DESC").fetchall()
         return [dict(r) for r in rows]
 
     def getProxyFile(self, fileId: int) -> Optional[Dict[str, Any]]:
-        row = self._conn.execute(
-            "SELECT * FROM proxyFiles WHERE id=?", (fileId,)
-        ).fetchone()
+        row = self._conn.execute("SELECT * FROM proxyFiles WHERE id=?", (fileId,)).fetchone()
         return dict(row) if row else None
 
     def deleteProxyFile(self, fileId: int) -> None:
@@ -277,8 +282,8 @@ class Database:
     def getAllProxies(self) -> List[str]:
         rows = self._conn.execute("SELECT content FROM proxyFiles").fetchall()
         proxies = []
-        for row in rows:
-            for line in row["content"].splitlines():
+        for r in rows:
+            for line in r["content"].splitlines():
                 line = line.strip()
                 if line:
                     proxies.append(line)

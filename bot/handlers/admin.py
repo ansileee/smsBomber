@@ -55,7 +55,8 @@ def usersListKeyboard(page: int, totalPages: int, users: list) -> InlineKeyboard
     builder = InlineKeyboardBuilder()
     for u in users:
         name   = u["firstName"] or "Unknown"
-        status = "BANNED" if u["isBanned"] else f"{u['testsToday']}/{u['dailyLimit']}"
+        total  = u.get("testsTotal", u["testsToday"])  # fallback for old rows
+        status = "BANNED" if u["isBanned"] else f"{total} tests"
         label  = f"{name}  -  {status}"
         builder.button(text=label, callback_data=f"adm:user:{u['userId']}")
     if page > 0:
@@ -113,16 +114,18 @@ def formatUserDetail(u: dict) -> str:
     name = u["firstName"] or "Unknown"
     if u.get("lastName"):
         name += f" {u['lastName']}"
-    username  = f"@{u['username']}" if u.get("username") else "no username"
-    status    = "BANNED" if u["isBanned"] else "Active"
-    joined    = datetime.fromtimestamp(u["joinedAt"], tz=IST).strftime("%d %b %Y")
-    tests_str = f"{u['testsToday']} / {u['dailyLimit']} today"
+    username   = f"@{u['username']}" if u.get("username") else "no username"
+    status     = "BANNED" if u["isBanned"] else "Active"
+    joined     = datetime.fromtimestamp(u["joinedAt"], tz=IST).strftime("%d %b %Y")
+    today_str  = f"{u['testsToday']} / {u['dailyLimit']} today"
+    total      = u.get("testsTotal", u["testsToday"])
     return (
         f"{b(_esc(name))}  {c(_esc(username))}\n\n"
-        f"ID       {c(str(u['userId']))}\n"
-        f"Status   {c(status)}\n"
-        f"Tests    {c(tests_str)}\n"
-        f"Joined   {c(joined)}"
+        f"ID        {c(str(u['userId']))}\n"
+        f"Status    {c(status)}\n"
+        f"Today     {c(today_str)}\n"
+        f"All time  {c(str(total))} tests\n"
+        f"Joined    {c(joined)}"
     )
 
 
@@ -181,6 +184,7 @@ async def cbAdminStats(callback: CallbackQuery) -> None:
     banned          = sum(1 for u in users if u["isBanned"])
     activeToday     = sum(1 for u in users if u["testsToday"] > 0)
     totalTestsToday = sum(u["testsToday"] for u in users)
+    totalTestsEver  = sum(u.get("testsTotal", 0) for u in users)
     from bot.services.api_manager import apiManager
     apiTotal = len(apiManager.getMergedConfigs())
     skipped  = len(db.getSkippedApiNames())
@@ -189,7 +193,8 @@ async def cbAdminStats(callback: CallbackQuery) -> None:
         f"Users total    {c(str(total))}\n"
         f"Banned         {c(str(banned))}\n"
         f"Active today   {c(str(activeToday))}\n"
-        f"Tests today    {c(str(totalTestsToday))}\n\n"
+        f"Tests today    {c(str(totalTestsToday))}\n"
+        f"Tests all time {c(str(totalTestsEver))}\n\n"
         f"APIs active    {c(str(apiTotal - skipped))}\n"
         f"APIs skipped   {c(str(skipped))}",
         reply_markup=backToAdminKeyboard(),
