@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from datetime import datetime
 from typing import List
 
 from aiogram import Router, F
@@ -11,7 +12,7 @@ from aiogram.filters import StateFilter
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.config import ADMIN_ID
-from bot.services.database import db
+from bot.services.database import db, IST
 
 router = Router()
 
@@ -24,7 +25,7 @@ def isAdmin(userId: int) -> bool:
 
 class ProxyAdminStates(StatesGroup):
     waitingLabel = State()
-    waitingFile = State()
+    waitingFile  = State()
 
 
 # ---------------------------------------------------------------------------
@@ -34,24 +35,22 @@ class ProxyAdminStates(StatesGroup):
 def proxyManagerMenuKeyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="Upload Proxy File", callback_data="aprx:upload")
-    builder.button(text="List Proxy Files", callback_data="aprx:list:0")
-    builder.button(text="Back", callback_data="adm:menu")
+    builder.button(text="List Proxy Files",  callback_data="aprx:list:0")
+    builder.button(text="Back",              callback_data="adm:menu")
     builder.adjust(2, 1)
     return builder.as_markup()
 
 
 def proxyFilesKeyboard(page: int, totalPages: int) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    files = db.getAllProxyFiles()
-    start = page * FILES_PER_PAGE
+    builder   = InlineKeyboardBuilder()
+    files     = db.getAllProxyFiles()
+    start     = page * FILES_PER_PAGE
     pageFiles = files[start:start + FILES_PER_PAGE]
-
     for f in pageFiles:
         builder.button(
             text=f"Delete: {f['label']} ({f['proxyCount']} proxies)",
             callback_data=f"aprx:delete:{f['id']}"
         )
-
     if page > 0:
         builder.button(text="Previous", callback_data=f"aprx:list:{page - 1}")
     if page < totalPages - 1:
@@ -78,7 +77,7 @@ async def cbProxyMenu(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Access denied.", show_alert=True)
         return
     await state.clear()
-    files = db.getAllProxyFiles()
+    files        = db.getAllProxyFiles()
     totalProxies = sum(f["proxyCount"] for f in files)
     await callback.message.edit_text(
         f"Proxy Manager\n\n"
@@ -92,7 +91,7 @@ async def cbProxyMenu(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Upload flow: label → file
+# Upload flow
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "aprx:upload")
@@ -116,7 +115,7 @@ async def handleLabel(message: Message, state: FSMContext) -> None:
         return
     label = (message.text or "").strip()
     if not label or len(label) > 64:
-        await message.answer("Label must be 1–64 characters. Try again.")
+        await message.answer("Label must be 1-64 characters. Try again.")
         return
     await state.update_data(proxyLabel=label)
     await state.set_state(ProxyAdminStates.waitingFile)
@@ -135,38 +134,28 @@ async def handleLabel(message: Message, state: FSMContext) -> None:
 async def handleProxyFile(message: Message, state: FSMContext) -> None:
     if not isAdmin(message.from_user.id):
         return
-
     doc = message.document
     if not doc.file_name.endswith(".txt"):
         await message.answer("Please send a .txt file.")
         return
-
     if doc.file_size > 5 * 1024 * 1024:
         await message.answer("File too large. Maximum size is 5 MB.")
         return
-
-    data = await state.get_data()
+    data  = await state.get_data()
     label = data.get("proxyLabel", "Unnamed")
-
-    # Download file content
     fileObj = await message.bot.get_file(doc.file_id)
-    buf = io.BytesIO()
+    buf     = io.BytesIO()
     await message.bot.download_file(fileObj.file_path, buf)
     content = buf.getvalue().decode("utf-8", errors="ignore")
-
     proxies = [line.strip() for line in content.splitlines() if line.strip()]
-    count = len(proxies)
-
+    count   = len(proxies)
     if count == 0:
         await message.answer("The file appears to be empty. No proxies found.")
         return
-
     db.addProxyFile(label=label, content=content, proxyCount=count)
     await state.clear()
-
-    totalFiles = len(db.getAllProxyFiles())
-    allProxies = db.getAllProxies()
-
+    totalFiles  = len(db.getAllProxyFiles())
+    allProxies  = db.getAllProxies()
     await message.answer(
         f"Proxy file saved.\n\n"
         f"Label   : {label}\n"
@@ -196,34 +185,23 @@ async def cbListFiles(callback: CallbackQuery) -> None:
     if not isAdmin(callback.from_user.id):
         await callback.answer("Access denied.", show_alert=True)
         return
-
-    page = int(callback.data.split(":")[2])
+    page  = int(callback.data.split(":")[2])
     files = db.getAllProxyFiles()
-
     if not files:
         await callback.message.edit_text(
-            "No proxy files uploaded yet.\n\n"
-            "Use Upload Proxy File to add one.",
+            "No proxy files uploaded yet.\n\nUse Upload Proxy File to add one.",
             reply_markup=backToProxyMenuKeyboard()
         )
         await callback.answer()
         return
-
     totalPages = max(1, -(-len(files) // FILES_PER_PAGE))
-    start = page * FILES_PER_PAGE
-    pageFiles = files[start:start + FILES_PER_PAGE]
-
-    from datetime import datetime, timezone, timedelta
-    from bot.config import IST_OFFSET_HOURS
-    IST = timezone(timedelta(hours=IST_OFFSET_HOURS))
-
+    start      = page * FILES_PER_PAGE
+    pageFiles  = files[start:start + FILES_PER_PAGE]
     lines = [f"Proxy Files  (page {page + 1}/{totalPages})\n"]
     for f in pageFiles:
         dt = datetime.fromtimestamp(f["uploadedAt"], tz=IST).strftime("%d %b %Y %H:%M")
-        lines.append(f"{f['label']}  —  {f['proxyCount']} proxies  —  {dt}")
-
+        lines.append(f"{f['label']}  -  {f['proxyCount']} proxies  -  {dt}")
     lines.append("\nPress a delete button below to remove a file.")
-
     await callback.message.edit_text(
         "\n".join(lines),
         reply_markup=proxyFilesKeyboard(page, totalPages)
@@ -240,18 +218,13 @@ async def cbDeleteFile(callback: CallbackQuery) -> None:
     if not isAdmin(callback.from_user.id):
         await callback.answer("Access denied.", show_alert=True)
         return
-
     fileId = int(callback.data.split(":")[2])
-    f = db.getProxyFile(fileId)
-
+    f      = db.getProxyFile(fileId)
     if not f:
         await callback.answer("File not found.", show_alert=True)
         return
-
     db.deleteProxyFile(fileId)
     await callback.answer(f"Deleted: {f['label']}")
-
-    # Refresh list
     files = db.getAllProxyFiles()
     if not files:
         await callback.message.edit_text(
@@ -260,19 +233,12 @@ async def cbDeleteFile(callback: CallbackQuery) -> None:
             reply_markup=backToProxyMenuKeyboard()
         )
         return
-
     totalPages = max(1, -(-len(files) // FILES_PER_PAGE))
-    from datetime import datetime, timezone, timedelta
-    from bot.config import IST_OFFSET_HOURS
-    IST = timezone(timedelta(hours=IST_OFFSET_HOURS))
-
-    lines = [f"Proxy Files  (page 1/{totalPages})\n"]
+    lines      = [f"Proxy Files  (page 1/{totalPages})\n"]
     for f2 in files[:FILES_PER_PAGE]:
         dt = datetime.fromtimestamp(f2["uploadedAt"], tz=IST).strftime("%d %b %Y %H:%M")
-        lines.append(f"{f2['label']}  —  {f2['proxyCount']} proxies  —  {dt}")
-
+        lines.append(f"{f2['label']}  -  {f2['proxyCount']} proxies  -  {dt}")
     lines.append("\nPress a delete button below to remove a file.")
-
     await callback.message.edit_text(
         "\n".join(lines),
         reply_markup=proxyFilesKeyboard(0, totalPages)

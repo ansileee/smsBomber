@@ -5,18 +5,23 @@ from aiogram.types import CallbackQuery
 
 from bot.keyboards.menus import configKeyboard, configWorkersKeyboard, backToMainKeyboard
 from bot.config import DEFAULT_WORKERS
+from bot.services.database import db
 from bot.utils import PM, b, i, c
 
 router = Router()
 
-cfg = {
-    "defaultWorkers": DEFAULT_WORKERS,
-    "proxyEnabled":   False,
-}
 
+def getDefaultWorkers() -> int:
+    return int(db.getSetting("defaultWorkers", str(DEFAULT_WORKERS)))
 
-def getCfg() -> dict:
-    return cfg
+def setDefaultWorkers(val: int) -> None:
+    db.setSetting("defaultWorkers", str(val))
+
+def getProxyEnabled() -> bool:
+    return db.getSetting("proxyEnabled", "0") == "1"
+
+def setProxyEnabled(val: bool) -> None:
+    db.setSetting("proxyEnabled", "1" if val else "0")
 
 
 @router.callback_query(F.data == "menu:config")
@@ -25,16 +30,18 @@ async def cbConfig(callback: CallbackQuery) -> None:
 
 
 async def showConfig(callback: CallbackQuery) -> None:
-    proxy = "Enabled" if cfg["proxyEnabled"] else "Disabled"
-    text  = (
+    workers = getDefaultWorkers()
+    proxy   = getProxyEnabled()
+    proxyStr = "Enabled" if proxy else "Disabled"
+    text = (
         f"{b('Settings')}\n\n"
-        f"Default workers   {c(str(cfg['defaultWorkers']))}\n"
-        f"Proxy by default  {c(proxy)}"
+        f"Default workers   {c(str(workers))}\n"
+        f"Proxy by default  {c(proxyStr)}"
     )
     try:
         await callback.message.edit_text(
             text,
-            reply_markup=configKeyboard(cfg["defaultWorkers"], cfg["proxyEnabled"]),
+            reply_markup=configKeyboard(workers, proxy),
             parse_mode=PM
         )
     except Exception:
@@ -55,15 +62,16 @@ async def cbCfgWorkers(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("cfg:set_workers:"))
 async def cbCfgSetWorkers(callback: CallbackQuery) -> None:
     workers = int(callback.data.split(":")[2])
-    cfg["defaultWorkers"] = workers
+    setDefaultWorkers(workers)
     await callback.answer(f"Default workers set to {workers}.")
     await showConfig(callback)
 
 
 @router.callback_query(F.data == "cfg:toggle_proxy")
 async def cbCfgToggleProxy(callback: CallbackQuery) -> None:
-    cfg["proxyEnabled"] = not cfg["proxyEnabled"]
-    status = "enabled" if cfg["proxyEnabled"] else "disabled"
+    current = getProxyEnabled()
+    setProxyEnabled(not current)
+    status = "enabled" if not current else "disabled"
     await callback.answer(f"Proxy default {status}.")
     await showConfig(callback)
 

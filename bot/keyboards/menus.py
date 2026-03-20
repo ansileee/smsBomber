@@ -4,42 +4,49 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 def mainMenuKeyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="Start Test", callback_data="menu:start_test")
-    builder.button(text="My History", callback_data="menu:history")
-    builder.button(text="Settings",   callback_data="menu:config")
-    builder.button(text="Help",       callback_data="menu:help")
-    builder.adjust(2, 2)
+    builder.button(text="Start Test",  callback_data="menu:start_test")
+    builder.button(text="My History",  callback_data="menu:history")
+    builder.button(text="Favorites",   callback_data="menu:favorites")
+    builder.button(text="Presets",     callback_data="menu:presets")
+    builder.button(text="Schedule",    callback_data="menu:schedule")
+    builder.button(text="My Stats",    callback_data="menu:stats")
+    builder.button(text="Referral",    callback_data="menu:referral")
+    builder.button(text="Settings",    callback_data="menu:config")
+    builder.button(text="Help",        callback_data="menu:help")
+    builder.adjust(2, 2, 2, 2, 1)
     return builder.as_markup()
 
 
-def wizardKeyboard(hasDuration: bool, hasWorkers: bool) -> InlineKeyboardMarkup:
+def durationKeyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="30s",     callback_data="dur:30")
-    builder.button(text="1 min",   callback_data="dur:60")
-    builder.button(text="5 min",   callback_data="dur:300")
-    builder.button(text="10 min",  callback_data="dur:600")
-    builder.button(text="2 workers",  callback_data="wrk:2")
-    builder.button(text="4 workers",  callback_data="wrk:4")
-    builder.button(text="8 workers",  callback_data="wrk:8")
-    builder.button(text="16 workers", callback_data="wrk:16")
-    builder.button(text="Custom duration", callback_data="dur:custom")
-    builder.button(text="Custom workers",  callback_data="wrk:custom")
-    if hasDuration and hasWorkers:
-        builder.button(text="Continue -->", callback_data="wizard:continue")
-        builder.button(text="Back",         callback_data="nav:main_menu")
-        builder.adjust(4, 4, 2, 1, 1)
-    else:
-        builder.button(text="Back", callback_data="nav:main_menu")
-        builder.adjust(4, 4, 2, 1)
+    builder.button(text="30s",    callback_data="dur:30")
+    builder.button(text="1 min",  callback_data="dur:60")
+    builder.button(text="5 min",  callback_data="dur:300")
+    builder.button(text="10 min", callback_data="dur:600")
+    builder.button(text="Custom", callback_data="dur:custom")
+    builder.button(text="Back",   callback_data="nav:main_menu")
+    builder.adjust(4, 1, 1)
+    return builder.as_markup()
+
+
+def workersKeyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="2",      callback_data="wrk:2")
+    builder.button(text="4",      callback_data="wrk:4")
+    builder.button(text="8",      callback_data="wrk:8")
+    builder.button(text="16",     callback_data="wrk:16")
+    builder.button(text="Custom", callback_data="wrk:custom")
+    builder.button(text="Back",   callback_data="nav:duration")
+    builder.adjust(4, 1, 1)
     return builder.as_markup()
 
 
 def proxyKeyboard(hasProxies: bool) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="No proxy",   callback_data="proxy:none")
+    builder.button(text="No proxy", callback_data="proxy:none")
     if hasProxies:
         builder.button(text="Use proxy", callback_data="proxy:file")
-    builder.button(text="Back",        callback_data="nav:wizard")
+    builder.button(text="Back", callback_data="nav:workers")
     builder.adjust(2 if hasProxies else 1, 1)
     return builder.as_markup()
 
@@ -63,9 +70,10 @@ def runningKeyboard() -> InlineKeyboardMarkup:
 def finishedKeyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="Repeat Test", callback_data="test:repeat")
+    builder.button(text="Save Preset", callback_data="preset:save")
     builder.button(text="New Test",    callback_data="menu:start_test")
     builder.button(text="Main Menu",   callback_data="nav:main_menu")
-    builder.adjust(2, 1)
+    builder.adjust(2, 2)
     return builder.as_markup()
 
 

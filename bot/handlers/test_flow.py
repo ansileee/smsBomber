@@ -11,8 +11,8 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.keyboards.menus import (
-    wizardKeyboard, proxyKeyboard, confirmKeyboard,
-    runningKeyboard, finishedKeyboard, mainMenuKeyboard,
+    durationKeyboard, workersKeyboard, proxyKeyboard,
+    confirmKeyboard, runningKeyboard, finishedKeyboard, mainMenuKeyboard,
 )
 from bot.services.tester_runner import TesterRunner, validateProxies
 from bot.services.proxy_manager import proxyManager
@@ -28,6 +28,7 @@ activeRunners:   Dict[int, TesterRunner] = {}
 dashboardTasks:  Dict[int, asyncio.Task] = {}
 summaryShown:    Dict[int, bool]         = {}
 activeRecordIds: Dict[int, int]          = {}
+_lastConfig:     Dict[int, dict]         = {}
 
 PROTECTED_RESPONSES = [
     "Poda kunne onn!!!",
@@ -39,8 +40,9 @@ PROTECTED_RESPONSES = [
 
 class TestWizard(StatesGroup):
     phone          = State()
-    wizard         = State()
+    duration       = State()   # Step 1
     durationCustom = State()
+    workers        = State()   # Step 2
     workersCustom  = State()
     proxy          = State()
     proxyChecking  = State()
@@ -70,27 +72,18 @@ def parseTime(t: str) -> Optional[int]:
         return None
 
 
-def wizardText(data: dict) -> str:
-    dur   = formatDuration(data["duration"]) if data.get("duration") else "not set"
-    wrk   = str(data["workers"]) if data.get("workers") else "not set"
-    phone = data.get("phone", "")
-    both  = data.get("duration") and data.get("workers")
-    hint  = "Both set — tap Continue to proceed." if both else "Select duration and workers below."
-    # Show active API count
-    try:
-        from bot.services.api_manager import apiManager
-        from bot.services.database import db as _db
-        total   = len(apiManager.getMergedConfigs())
-        skipped = len(_db.getSkippedApiNames())
-        api_str = f"\nAPIs       {c(str(total - skipped))} active"
-    except Exception:
-        api_str = ""
+def durationText(phone: str) -> str:
     return (
-        f"{b('Configure Test')}  {c(phone)}\n\n"
-        f"Duration   {c(dur)}\n"
-        f"Workers    {c(wrk)}"
-        f"{api_str}\n\n"
-        f"{i(hint)}"
+        f"{b('Step 1 of 2')}  {c(phone)}\n\n"
+        f"Select test duration."
+    )
+
+
+def workersText(phone: str, duration: int) -> str:
+    return (
+        f"{b('Step 2 of 2')}  {c(phone)}\n\n"
+        f"Duration   {c(formatDuration(duration))}\n\n"
+        f"Select number of workers."
     )
 
 
@@ -238,6 +231,10 @@ def _saveHistory(userId, snap):
             pass
 
 
+# ---------------------------------------------------------------------------
+# Entry: Start Test
+# ---------------------------------------------------------------------------
+
 @router.callback_query(F.data == "menu:start_test")
 async def cbStartTest(callback: CallbackQuery, state: FSMContext) -> None:
     userId = callback.from_user.id
@@ -271,6 +268,10 @@ async def cbStartTest(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+# ---------------------------------------------------------------------------
+# Phone input
+# ---------------------------------------------------------------------------
+
 @router.message(StateFilter(TestWizard.phone))
 async def handlePhone(message: Message, state: FSMContext) -> None:
     phone = (message.text or "").strip()
@@ -286,22 +287,26 @@ async def handlePhone(message: Message, state: FSMContext) -> None:
     if db.isPhoneBlacklisted(phone) and message.from_user.id != ADMIN_ID:
         await message.answer("That number is not available for testing.")
         return
-    await state.update_data(phone=phone, duration=None, workers=None)
-    await state.set_state(TestWizard.wizard)
+    await state.update_data(phone=phone)
+    await state.set_state(TestWizard.duration)
     await message.answer(
-        wizardText({"phone": phone}),
-        reply_markup=wizardKeyboard(False, False),
+        durationText(phone),
+        reply_markup=durationKeyboard(),
         parse_mode=PM
     )
 
 
-@router.callback_query(F.data.startswith("dur:"), StateFilter(TestWizard.wizard))
+# ---------------------------------------------------------------------------
+# Step 1: Duration
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("dur:"), StateFilter(TestWizard.duration))
 async def cbDuration(callback: CallbackQuery, state: FSMContext) -> None:
     value = callback.data.split(":")[1]
     if value == "custom":
         await state.set_state(TestWizard.durationCustom)
         builder = InlineKeyboardBuilder()
-        builder.button(text="Back", callback_data="nav:wizard")
+        builder.button(text="Back", callback_data="nav:duration")
         await callback.message.edit_text(
             f"{b('Custom Duration')}\n\nEnter a value: {c('30s')}  {c('5m')}  {c('1h')}\n{i('Min: 5s  Max: 24h')}",
             reply_markup=builder.as_markup(), parse_mode=PM
@@ -309,11 +314,11 @@ async def cbDuration(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         return
     data = await state.get_data()
-    data["duration"] = int(value)
     await state.update_data(duration=int(value))
+    await state.set_state(TestWizard.workers)
     await callback.message.edit_text(
-        wizardText(data),
-        reply_markup=wizardKeyboard(True, bool(data.get("workers"))),
+        workersText(data["phone"], int(value)),
+        reply_markup=workersKeyboard(),
         parse_mode=PM
     )
     await callback.answer(f"Duration: {formatDuration(int(value))}")
@@ -329,23 +334,38 @@ async def handleDurationCustom(message: Message, state: FSMContext) -> None:
         )
         return
     data = await state.get_data()
-    data["duration"] = seconds
     await state.update_data(duration=seconds)
-    await state.set_state(TestWizard.wizard)
+    await state.set_state(TestWizard.workers)
     await message.answer(
-        wizardText(data),
-        reply_markup=wizardKeyboard(True, bool(data.get("workers"))),
+        workersText(data["phone"], seconds),
+        reply_markup=workersKeyboard(),
         parse_mode=PM
     )
 
 
-@router.callback_query(F.data.startswith("wrk:"), StateFilter(TestWizard.wizard))
+@router.callback_query(F.data == "nav:duration")
+async def cbBackToDuration(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(TestWizard.duration)
+    data = await state.get_data()
+    await callback.message.edit_text(
+        durationText(data["phone"]),
+        reply_markup=durationKeyboard(),
+        parse_mode=PM
+    )
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Workers
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("wrk:"), StateFilter(TestWizard.workers))
 async def cbWorkers(callback: CallbackQuery, state: FSMContext) -> None:
     value = callback.data.split(":")[1]
     if value == "custom":
         await state.set_state(TestWizard.workersCustom)
         builder = InlineKeyboardBuilder()
-        builder.button(text="Back", callback_data="nav:wizard")
+        builder.button(text="Back", callback_data="nav:workers")
         await callback.message.edit_text(
             f"{b('Custom Workers')}\n\nEnter a number between {c('1')} and {c('64')}.",
             reply_markup=builder.as_markup(), parse_mode=PM
@@ -353,12 +373,12 @@ async def cbWorkers(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         return
     data = await state.get_data()
-    data["workers"] = int(value)
     await state.update_data(workers=int(value))
+    await state.set_state(TestWizard.proxy)
+    hasProxies = proxyManager.hasProxies()
     await callback.message.edit_text(
-        wizardText(data),
-        reply_markup=wizardKeyboard(bool(data.get("duration")), True),
-        parse_mode=PM
+        f"{b('Proxy Settings')}\n\nUse a proxy for this test?",
+        reply_markup=proxyKeyboard(hasProxies), parse_mode=PM
     )
     await callback.answer(f"Workers: {value}")
 
@@ -373,42 +393,30 @@ async def handleWorkersCustom(message: Message, state: FSMContext) -> None:
         await message.answer(f"Enter a number between {c('1')} and {c('64')}.", parse_mode=PM)
         return
     data = await state.get_data()
-    data["workers"] = workers
     await state.update_data(workers=workers)
-    await state.set_state(TestWizard.wizard)
-    await message.answer(
-        wizardText(data),
-        reply_markup=wizardKeyboard(bool(data.get("duration")), True),
-        parse_mode=PM
-    )
-
-
-@router.callback_query(F.data == "nav:wizard")
-async def cbBackToWizard(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(TestWizard.wizard)
-    data = await state.get_data()
-    await callback.message.edit_text(
-        wizardText(data),
-        reply_markup=wizardKeyboard(bool(data.get("duration")), bool(data.get("workers"))),
-        parse_mode=PM
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "wizard:continue", StateFilter(TestWizard.wizard))
-async def cbWizardContinue(callback: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    if not data.get("duration") or not data.get("workers"):
-        await callback.answer("Select both duration and workers first.", show_alert=True)
-        return
     await state.set_state(TestWizard.proxy)
     hasProxies = proxyManager.hasProxies()
-    await callback.message.edit_text(
+    await message.answer(
         f"{b('Proxy Settings')}\n\nUse a proxy for this test?",
         reply_markup=proxyKeyboard(hasProxies), parse_mode=PM
     )
+
+
+@router.callback_query(F.data == "nav:workers")
+async def cbBackToWorkers(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(TestWizard.workers)
+    data = await state.get_data()
+    await callback.message.edit_text(
+        workersText(data["phone"], data.get("duration", 0)),
+        reply_markup=workersKeyboard(),
+        parse_mode=PM
+    )
     await callback.answer()
 
+
+# ---------------------------------------------------------------------------
+# Proxy
+# ---------------------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("proxy:"), StateFilter(TestWizard.proxy))
 async def cbProxy(callback: CallbackQuery, state: FSMContext) -> None:
@@ -452,13 +460,17 @@ async def cbProxy(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
 
 
+# ---------------------------------------------------------------------------
+# Confirm
+# ---------------------------------------------------------------------------
+
 @router.callback_query(F.data == "confirm:edit", StateFilter(TestWizard.confirm))
 async def cbConfirmEdit(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(TestWizard.wizard)
+    await state.set_state(TestWizard.workers)
     data = await state.get_data()
     await callback.message.edit_text(
-        wizardText(data),
-        reply_markup=wizardKeyboard(bool(data.get("duration")), bool(data.get("workers"))),
+        workersText(data["phone"], data.get("duration", 0)),
+        reply_markup=workersKeyboard(),
         parse_mode=PM
     )
     await callback.answer()
@@ -521,6 +533,10 @@ async def cbConfirmStart(callback: CallbackQuery, state: FSMContext) -> None:
     dashboardTasks[userId] = task
 
 
+# ---------------------------------------------------------------------------
+# Stop
+# ---------------------------------------------------------------------------
+
 @router.callback_query(F.data == "test:stop")
 async def cbStopTest(callback: CallbackQuery, state: FSMContext) -> None:
     userId = callback.from_user.id
@@ -540,9 +556,8 @@ async def cbStopTest(callback: CallbackQuery, state: FSMContext) -> None:
     await runner.stop()
     snap = runner.stats.snapshot()
     _saveHistory(userId, snap)
-    # Save last config for repeat
     _lastConfig[userId] = {
-        "phone":   runner.phone,
+        "phone":    runner.phone,
         "duration": runner.duration,
         "workers":  runner.workers,
     }
@@ -557,9 +572,9 @@ async def cbStopTest(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.message.answer(summary, reply_markup=finishedKeyboard(), parse_mode=PM)
 
 
-# Store last config per user for repeat
-_lastConfig: Dict[int, dict] = {}
-
+# ---------------------------------------------------------------------------
+# Repeat
+# ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "test:repeat")
 async def cbRepeatTest(callback: CallbackQuery, state: FSMContext) -> None:
@@ -605,6 +620,10 @@ async def cbRepeatTest(callback: CallbackQuery, state: FSMContext) -> None:
     )
     dashboardTasks[userId] = task
 
+
+# ---------------------------------------------------------------------------
+# History
+# ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "menu:history")
 async def cbUserHistory(callback: CallbackQuery) -> None:

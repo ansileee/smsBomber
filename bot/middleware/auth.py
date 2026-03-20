@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import random
 from typing import Any, Awaitable, Callable, Dict
 
 from aiogram import BaseMiddleware
@@ -10,14 +9,6 @@ from bot.services.database import db
 from bot.config import ADMIN_ID
 
 
-PROTECTED_RESPONSES = [
-    "Poda kunne onn!!!",
-    "Onn poyeda vadhoori",
-    "Ninta pari!",
-    "Ntelekk ondaakaan varalletta myre, chethi kallayum panni ninta suna!!",
-]
-
-
 class AuthMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -25,7 +16,6 @@ class AuthMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any],
     ) -> Any:
-        # Extract user from the update
         user = None
         if isinstance(event, Message):
             user = event.from_user
@@ -42,7 +32,6 @@ class AuthMiddleware(BaseMiddleware):
 
         userId = user.id
 
-        # Register user and notify admin if new
         isNew = db.registerUser(
             userId=userId,
             username=user.username,
@@ -51,18 +40,18 @@ class AuthMiddleware(BaseMiddleware):
         )
 
         if isNew and userId != ADMIN_ID:
-            await notifyAdminNewUser(data, user)
+            await _notifyAdminNewUser(data, user)
 
         return await handler(event, data)
 
 
-async def notifyAdminNewUser(data: Dict[str, Any], user: Any) -> None:
+async def _notifyAdminNewUser(data: Dict[str, Any], user: Any) -> None:
     try:
         bot = data.get("bot")
         if not bot:
             return
         username = f"@{user.username}" if user.username else "no username"
-        name = f"{user.first_name} {user.last_name or ''}".strip()
+        name     = f"{user.first_name} {user.last_name or ''}".strip()
         text = (
             "New User\n\n"
             f"Name     : {name}\n"

