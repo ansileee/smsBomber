@@ -10,7 +10,7 @@ from aiohttp import web
 
 from bot.config import BOT_TOKEN
 from bot.handlers import start, test_flow, dashboard, admin
-from bot.handlers import admin_apis, admin_proxy, user_features, admin_features, schedule_handler, live_dashboard, nuke_handler
+from bot.handlers import admin_apis, admin_proxy, user_features, admin_features, schedule_handler, live_dashboard, nuke_handler, distributed_handler
 from bot.middleware.auth import AuthMiddleware
 from bot.services.scheduler import midnightResetLoop, scheduledTestsLoop
 
@@ -42,6 +42,7 @@ def registerRouters(dp: Dispatcher) -> None:
     dp.include_router(schedule_handler.router)
     dp.include_router(live_dashboard.router)
     dp.include_router(nuke_handler.router)
+    dp.include_router(distributed_handler.router)
 
 
 async def onStartup(bot: Bot) -> None:
@@ -68,6 +69,14 @@ async def mainWebhook() -> None:
 
     asyncio.create_task(midnightResetLoop())
     asyncio.create_task(scheduledTestsLoop(bot))
+
+    # Start distributed coordination
+    try:
+        from distributed import startDistributed
+        from bot.services.database import db
+        asyncio.create_task(startDistributed(db, bot))
+    except Exception:
+        pass
 
     runner = web.AppRunner(app)
     await runner.setup()

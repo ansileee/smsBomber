@@ -146,19 +146,23 @@ def buildDashboardText(snap: dict, phones: list, duration: int) -> str:
     responses  = snap.get("responses", 0)
     remaining  = max(0, duration - int(elapsed))
     rps_str    = str(snap["rps"])
+    surges     = snap.get("surgeCount", 0)
+    honeypots  = sum(1 for s in snap["perApi"].values() if s.get("status") == "honeypot")
 
     status_bits = []
     if rl_count:   status_bits.append(f"RL {rl_count}")
     if dead_count: status_bits.append(f"Dead {dead_count}")
+    if honeypots:  status_bits.append(f"Fake {honeypots}")
     status_str = "  [ " + "  ".join(status_bits) + " ]" if status_bits else ""
 
     phoneDisplay = ", ".join(phones) if len(phones) <= 3 else f"{phones[0]} +{len(phones)-1} more"
+    surgeStr = f"  {i(str(surges) + ' surges')}" if surges > 0 else ""
 
     return (
         f"{b('Test Running')}  {c(hEsc(phoneDisplay))}\n"
         f"<code>{bar}</code>  {c(f'{int(pct*100)}%')}  {i(f'{int(elapsed)}s / {duration}s')}\n\n"
         f"Remaining   {c(formatDuration(remaining))}\n"
-        f"Requests    {c(str(totalReqs))}  {i(rps_str + ' r/s')}\n"
+        f"Requests    {c(str(totalReqs))}  {i(rps_str + ' r/s')}{surgeStr}\n"
         f"Confirmed   {c(str(confirmed))}\n"
         f"2xx Total   {c(str(responses))}\n"
         f"Errors      {c(str(snap['errors']))}{status_str}\n\n"
