@@ -1,32 +1,19 @@
-"""Shared utilities for the bot."""
+# Add this function to bot/utils.py
+# Then replace all bare `await callback.answer()` calls with `await safeAnswer(callback)`
+# and `await callback.answer("text", show_alert=True)` with `await safeAnswer(callback, "text", True)`
+
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import CallbackQuery
 
 
-# HTML parse mode string — avoids importing aiogram at module level
-PM = "HTML"
-
-
-def b(t: str) -> str:
-    """Bold."""
-    return f"<b>{hEsc(t)}</b>"
-
-
-def i(t: str) -> str:
-    """Italic."""
-    return f"<i>{hEsc(t)}</i>"
-
-
-def c(t: str) -> str:
-    """Inline code."""
-    return f"<code>{hEsc(t)}</code>"
-
-
-def hEsc(t: str) -> str:
-    """Escape HTML special chars."""
-    if not isinstance(t, str):
-        t = str(t)
-    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-# Alias
-def mdEsc(t: str) -> str:
-    return hEsc(t)
+async def safeAnswer(callback: CallbackQuery, text: str = "", show_alert: bool = False) -> None:
+    """Answer a callback query, silently ignoring stale query errors."""
+    try:
+        await callback.answer(text, show_alert=show_alert)
+    except TelegramBadRequest as e:
+        if "query is too old" in str(e).lower() or "query id is invalid" in str(e).lower():
+            pass  # expired — ignore
+        else:
+            raise
+    except Exception:
+        pass

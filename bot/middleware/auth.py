@@ -3,10 +3,17 @@ from __future__ import annotations
 from typing import Any, Awaitable, Callable, Dict
 
 from aiogram import BaseMiddleware
-from aiogram.types import TelegramObject, Message, CallbackQuery, Update
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import CallbackQuery, Message, TelegramObject
 
 from bot.services.database import db
 from bot.config import ADMIN_ID
+
+PROTECTED_RESPONSES = [
+    "Poda kunne onn!!!",
+    "Onn poyeda vadhoori",
+    "Ninta pari!",
+]
 
 
 class AuthMiddleware(BaseMiddleware):
@@ -16,49 +23,76 @@ class AuthMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any],
     ) -> Any:
+
+        # Get user info from event
         user = None
         if isinstance(event, Message):
             user = event.from_user
         elif isinstance(event, CallbackQuery):
             user = event.from_user
-        elif isinstance(event, Update):
-            if event.message:
-                user = event.message.from_user
-            elif event.callback_query:
-                user = event.callback_query.from_user
 
-        if not user:
+        if user is None:
             return await handler(event, data)
 
         userId = user.id
 
-        isNew = db.registerUser(
-            userId=userId,
-            username=user.username,
-            firstName=user.first_name,
-            lastName=user.last_name,
-        )
+        # Register/update user silently
+        try:
+            db.registerUser(
+                userId,
+                user.username,
+                user.first_name or "User",
+                user.last_name,
+            )
+        except Exception:
+            pass
 
-        if isNew and userId != ADMIN_ID:
-            await _notifyAdminNewUser(data, user)
+        # Check maintenance mode — let admin through always
+        if userId != ADMIN_ID:
+            try:
+                if db.isMaintenanceMode():
+                    msg = db.getMaintenanceMessage()
+                    if isinstance(event, Message):
+                        await event.answer(f"🔧 {msg}")
+                    elif isinstance(event, CallbackQuery):
+                        try:
+                            await event.answer(f"🔧 {msg}", show_alert=True)
+                        except TelegramBadRequest:
+                            pass
+                    return
+            except Exception:
+                pass
 
-        return await handler(event, data)
+        # Check ban
+        if userId != ADMIN_ID:
+            try:
+                u = db.getUser(userId)
+                if u and u.get("isBanned"):
+                    if isinstance(event, Message):
+                        await event.answer("Your account has been restricted.")
+                    elif isinstance(event, CallbackQuery):
+                        try:
+                            await event.answer("Your account has been restricted.", show_alert=True)
+                        except TelegramBadRequest:
+                            pass
+                    return
+            except Exception:
+                pass
 
-
-async def _notifyAdminNewUser(data: Dict[str, Any], user: Any) -> None:
-    try:
-        bot = data.get("bot")
-        if not bot:
-            return
-        username = f"@{user.username}" if user.username else "no username"
-        name     = f"{user.first_name} {user.last_name or ''}".strip()
-        text = (
-            "New User\n\n"
-            f"Name     : {name}\n"
-            f"Username : {username}\n"
-            f"ID       : {user.id}\n\n"
-            f"<a href='tg://user?id={user.id}'>Open DM</a>"
-        )
-        await bot.send_message(ADMIN_ID, text, parse_mode="HTML")
-    except Exception:
-        pass
+        # Run handler — catch stale callback errors globally
+        try:
+            return await handler(event, data)
+        except TelegramBadRequest as e:
+            err = str(e).lower()
+            # Suppress known harmless errors
+            if any(x in err for x in [
+                "query is too old",
+                "query id is invalid",
+                "message is not modified",
+                "message to edit not found",
+                "message can't be edited",
+            ]):
+                return  # silently ignore
+            raise  # re-raise anything else
+        except Exception:
+            raise
