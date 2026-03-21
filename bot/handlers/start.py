@@ -41,6 +41,21 @@ async def cmdStart(message: Message) -> None:
 
     isNew = db.registerUser(userId, username, firstName, lastName)
 
+    # Notify admin of new user
+    if isNew:
+        try:
+            await message.bot.send_message(
+                ADMIN_ID,
+                f"👤 {b('New User')}\n\n"
+                f"Name     {c(hEsc(firstName))}\n"
+                f"Username {c('@' + hEsc(username) if username else 'none')}\n"
+                f"ID       {c(str(userId))}\n\n"
+                f"Total users: {c(str(db.getUserCount()))}",
+                parse_mode=PM
+            )
+        except Exception:
+            pass
+
     # Check maintenance
     if db.isMaintenanceMode() and userId != ADMIN_ID:
         await message.answer(
